@@ -1,0 +1,13 @@
+{
+  "name": "codex-intercom",
+  "version": "1.0.0",
+  "description": "Let Claude Code drive Codex sessions: send or steer messages, get woken exactly once when any Codex session stops (with the reason), and get periodic progress check-ins on long Codex tasks — while Claude Code stays idle.",
+  "author": {
+    "name": "MagicGeekSquad",
+    "url": "https://github.com/MagicGeekSquad"
+  },
+  "homepage": "https://github.com/MagicGeekSquad/codex-intercom",
+  "repository": "https://github.com/MagicGeekSquad/codex-intercom",
+  "license": "MIT",
+  "keywords": ["codex", "claude-code", "skill", "hooks", "multi-agent", "orchestration"]
+}

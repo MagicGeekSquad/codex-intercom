@@ -1,0 +1,11 @@
+# local development history, probes and logs (not part of the release)
+dev/
+*.log
+
+# editor / OS / Python
+.DS_Store
+__pycache__/
+*.pyc
+.claude/
+.idea/
+.vscode/

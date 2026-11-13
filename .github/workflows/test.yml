@@ -1,0 +1,42 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.9"
+          - os: ubuntu-latest
+            python: "3.13"
+          - os: macos-latest
+            python: "3.12"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit + integration tests (fake Codex, no network)
+        run: python tests/test_intercom.py
+      - name: Installer smoke test (throwaway HOME)
+        shell: bash
+        run: |
+          export HOME="$(mktemp -d)"
+          ./install.sh
+          test -f "$HOME/.claude/skills/codex-intercom/SKILL.md"
+          test -f "$HOME/.codex/hooks/codex_intercom.py"
+          grep -q codex_intercom "$HOME/.codex/hooks.json"
+          ./uninstall.sh --purge
+          test ! -e "$HOME/.claude/skills/codex-intercom"
+          ! grep -q codex_intercom "$HOME/.codex/hooks.json"
