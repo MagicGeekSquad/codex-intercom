@@ -99,7 +99,7 @@ sequenceDiagram
 |---|---|
 | OS | macOS or Linux (Windows is not supported) |
 | Python | 3.9+, standard library only (`/usr/bin/python3` on macOS works) |
-| Codex | [Codex CLI](https://github.com/openai/codex) with hooks (tested with `codex-cli 0.167.2`); the Codex App is optional |
+| Codex | [Codex CLI](https://github.com/openai/codex) with hooks (tested with `codex-cli` 0.167.2 and 0.169.0); the Codex App is optional |
 | Claude Code | any recent version (uses skills and background Bash tasks) |
 
 ## Installation

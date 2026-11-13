@@ -88,7 +88,7 @@ sequenceDiagram
 |---|---|
 | 操作系统 | macOS 或 Linux（不支持 Windows） |
 | Python | 3.9+，只用标准库（macOS 自带的 `/usr/bin/python3` 即可） |
-| Codex | 支持 hooks 的 [Codex CLI](https://github.com/openai/codex)（在 `codex-cli 0.167.2` 上测试）；Codex App 可选 |
+| Codex | 支持 hooks 的 [Codex CLI](https://github.com/openai/codex)（在 `codex-cli` 0.167.2 和 0.169.0 上测试）；Codex App 可选 |
 | Claude Code | 较新的版本即可（用到 skills 和后台 Bash 任务） |
 
 ## 安装
