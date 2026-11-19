@@ -15,11 +15,15 @@ Model
              listens: the next `listen` reports it.
 
 Commands
+  new        start a Codex session with its first message in a detached exec, and claim it.
   send       deliver a message and claim the session. Working -> steered into the running turn
              (injected at the next tool-call boundary, or as a continuation when the turn is about
              to end). Stopped -> `codex queue`; if the Codex App does not pick it up (it only serves
              sessions it has open), the queue is run with `codex exec resume` in the session's
-             working directory (transport "exec").
+             working directory (transport "exec"). Exec resume gets the model and reasoning effort
+             explicitly (--model/--effort, else saved by new/send, else the rollout's latest
+             turn_context): on its own it ignores the session's settings and uses config.toml
+             (openai/codex#32061).
   listen     block until any session this manager owns needs attention; print ONE JSON line
              covering all of them (the latest stop of each, plus how many earlier stops went
              unreported), advance the report cursors, exit. A session that keeps working is
@@ -46,8 +50,9 @@ Stop reasons
 
 Data: --dir, else $CODEX_INTERCOM_DIR, else ~/.codex/intercom/
   <session>/events.jsonl   hook event log           <session>/state.json  working / idle (steering)
-  <session>/session.json   owner, report cursor, sends not started yet, exec run
+  <session>/session.json   owner, report cursor, sends not started yet, exec run, exec settings
   <session>/inbox/ delivered/  steered messages      <session>/exec-*.log  exec-transport output
+  <session>/rollout-*.json model, effort and token usage cached from Codex's rollout (status, listen)
   _managers/<manager>.json owned sessions, listener, last activity
 Debug: create an empty file named DEBUG in the data dir to log raw hook inputs to debug.log.
 
@@ -62,6 +67,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -120,6 +126,13 @@ DEFAULT_CFG = {"error_grace": 15.0, "approval_grace": 30.0, "stall": 300.0, "mod
                "long_stall": 1800.0, "start_timeout": 300.0}
 DEFAULT_CHECKIN = 1800.0  # progress check-in for a session that keeps working (send/claim --checkin overrides)
 ROLLOUT_TAIL = 2 << 20  # bytes of the rollout read for a progress snapshot
+ROLLOUT_USAGE_LIMIT = 64 << 20  # maximum bytes for an uncached rollout lookup
+KEEP_USAGE_TURNS = 8
+EXEC_SETTING_FIELDS = ("model", "effort")
+NEW_EXEC_DIR = "_new"  # exec logs waiting for a thread id, including startup failures
+NEW_START_TIMEOUT = 60.0
+USAGE_FIELDS = {"input_tokens": "input", "cached_input_tokens": "cached_input", "output_tokens": "output",
+                "reasoning_output_tokens": "reasoning", "total_tokens": "total"}
 
 
 # ---------------------------------------------------------------------------- helpers
@@ -133,7 +146,7 @@ def ts_iso(t):
 
 
 def base_dir(explicit=None):
-    return explicit or os.environ.get("CODEX_INTERCOM_DIR") or DEFAULT_DIR
+    return os.path.abspath(explicit or os.environ.get("CODEX_INTERCOM_DIR") or DEFAULT_DIR)
 
 
 def manager_id(explicit=None):
@@ -295,35 +308,271 @@ def rollout_paths(sid):
     return sorted(glob.glob(os.path.join(root, "*", "*", "*", "rollout-*-%s.jsonl" % sid)))
 
 
-def rollout_progress(sid, turn_id):
-    """Best effort: what Codex did in this turn, from the tail of its rollout file (Codex's own format,
-    which may change; anything unreadable is skipped). None if nothing was found."""
-    paths = rollout_paths(sid)
-    if not paths or not turn_id:
-        return None
+def rollout_blocks(f, size, lower):
+    """Read backwards in blocks, carrying any split JSONL record into the preceding block."""
+    end = size
+    fragments = []
+    block_size = ROLLOUT_TAIL + 1  # allow one byte to establish the first tail line's boundary
+    while end > lower:
+        start = max(lower, end - block_size)
+        f.seek(start)
+        data = f.read(end - start)
+        end, block_size = start, ROLLOUT_TAIL
+        if start == 0:
+            yield start, data + b"".join(reversed(fragments))
+        else:
+            head, sep, rest = data.partition(b"\n")
+            if sep:
+                yield start + len(head) + 1, rest + b"".join(reversed(fragments))
+                fragments = [head + sep]
+            else:
+                fragments.append(data)
+                yield None, b""
+
+
+def rollout_appends(f, size, offset):
+    """Read only new bytes, starting at the end of the last complete cached record."""
+    f.seek(offset)
+    while offset < size:
+        data = f.read(min(ROLLOUT_TAIL, size - offset))
+        if not data:
+            break
+        if not data.endswith(b"\n"):
+            data += f.readline(size - offset - len(data))
+        yield offset, data
+        offset += len(data)
+
+
+def rollout_rows(offset, data, include_activity=False):
+    """Parse complete records and retain their byte offsets for resuming cached reads."""
+    if offset is None:
+        return [], None
+    events = ("task_started", "task_complete", "turn_aborted", "token_count")
+    if include_activity:
+        events += ("item_completed",)
+    markers = tuple(('"%s"' % kind).encode() for kind in ("turn_context",) + events)
+    length = data.rfind(b"\n") + 1
+    rows = []
+    pos = offset
+    for raw in data[:length].split(b"\n")[:-1]:
+        if any(marker in raw for marker in markers):
+            try:
+                row = json.loads(raw)
+            except (ValueError, UnicodeError):
+                row = None
+            if isinstance(row, dict) and isinstance(row.get("payload"), dict):
+                kind, payload = row.get("type"), row["payload"]
+                if kind == "turn_context" or (kind == "event_msg" and payload.get("type") in events):
+                    rows.append((pos, kind, payload))
+        pos += len(raw) + 1
+    return rows, offset + length
+
+
+def rollout_counts(payload):
+    info = payload.get("info")
+    total = info.get("total_token_usage") if isinstance(info, dict) else None
+    if not isinstance(total, dict):
+        return {}
+    return {name: total[key] for key, name in USAGE_FIELDS.items() if type(total.get(key)) is int and total[key] >= 0}
+
+
+def rollout_history(blocks, tail, offset, read_to, turn_id):
+    """Extend the usage window back to the target turn and its preceding cumulative sample."""
+    chunks = [tail]
+    started = context = baseline = False
+    while True:
+        for _, kind, payload in reversed(chunks[-1]):
+            if kind == "turn_context" and payload.get("turn_id") == turn_id:
+                context = True
+            elif payload.get("type") == "task_started" and payload.get("turn_id") == turn_id:
+                started = True
+            elif started and payload.get("type") == "token_count" and rollout_counts(payload):
+                baseline = True
+        if offset == 0 or (started and context and baseline):
+            break
+        block = next(blocks, None)
+        if block is None:
+            break
+        offset, data = block
+        rows, end = rollout_rows(offset, data)
+        chunks.append(rows)
+        if read_to is None:
+            read_to = end
+    return (row for chunk in reversed(chunks) for row in chunk), offset != 0, read_to
+
+
+def rollout_snapshot(box, turn_id=None, include_activity=False):
+    """Read activity from the tail and update known usage from the rollout's append interval."""
+    paths = rollout_paths(box.sid)
+    if not paths:
+        return {}
+    saved = read_json(box.usage_path, {}) if turn_id else {}
+    cached = (saved or {}).get(turn_id)
     try:
         with open(paths[-1], "rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            start = max(0, size - ROLLOUT_TAIL)
-            f.seek(start)
-            lines = f.read().split(b"\n")
+            st = os.fstat(f.fileno())
+            size = st.st_size
+            source = [st.st_dev, st.st_ino]
+            if cached and (cached["source"] != source or cached["size"] > size):
+                cached = None
+            tail, offset, end = [], None, None
+            if not cached or include_activity:
+                limit = ROLLOUT_TAIL + 1 if cached else ROLLOUT_USAGE_LIMIT
+                blocks = rollout_blocks(f, size, max(0, size - limit))
+                offset, data = next(blocks, (size, b""))
+                tail, end = rollout_rows(offset, data, include_activity)
+            if cached and cached["closed"]:
+                usage = cached["usage"]
+            else:
+                rows, partial, read_to = tail, offset != 0, end
+                if cached:
+                    start = cached["offset"]
+                    if offset is not None and offset <= start:
+                        rows = (row for row in tail if row[0] >= start)
+                    else:
+                        read_to = start
+
+                        def appended_rows():
+                            nonlocal read_to
+                            for pos, data in rollout_appends(f, size, start):
+                                batch, read_to = rollout_rows(pos, data)
+                                yield from batch
+
+                        rows = appended_rows()
+                elif turn_id and partial:
+                    rows, partial, read_to = rollout_history(blocks, tail, offset, end, turn_id)
+                usage, entry = rollout_usage(rows, turn_id, partial, cached)
+                if turn_id and (entry["start"] is not None or usage) and read_to is not None and (
+                        not cached or read_to > cached["offset"]):
+                    entry.update(source=source, size=size, offset=read_to)
+                    box.cache_rollout(box.usage_path, turn_id, entry)
     except OSError:
-        return None
-    if start:
-        lines = lines[1:]  # the first line was cut
+        return {}
+    out = {}
+    if usage:
+        out["usage"] = usage
+    if include_activity and turn_id:
+        activity = rollout_activity(tail, turn_id, bool(size > ROLLOUT_TAIL))
+        if activity:
+            out["activity"] = activity
+    return out
+
+
+def rollout_settings(box):
+    """Keep the newest nonempty value per setting. Bound the initial backward lookup only."""
+    paths = rollout_paths(box.sid)
+    if not paths:
+        return {}
+    cached = (read_json(box.settings_path, {}) or {}).get("latest")
+    try:
+        with open(paths[-1], "rb") as f:
+            st = os.fstat(f.fileno())
+            size = st.st_size
+            source = [st.st_dev, st.st_ino]
+            if cached and (cached["source"] != source or cached["size"] > size
+                           or (cached["size"] == size and cached["mtime"] != st.st_mtime_ns)):
+                cached = None
+            if cached:
+                found = dict(cached["settings"])
+                blocks = rollout_appends(f, size, cached["offset"]) if cached["size"] != size else ()
+            else:
+                found = {}
+                blocks = rollout_blocks(f, size, max(0, size - ROLLOUT_USAGE_LIMIT))
+            read_to = None
+            for offset, data in blocks:
+                rows, end = rollout_rows(offset, data)
+                if end is not None:
+                    read_to = max(read_to or 0, end)
+                for pos, kind, payload in rows:
+                    if kind == "turn_context":
+                        for key in EXEC_SETTING_FIELDS:
+                            value = payload.get(key)
+                            if isinstance(value, str) and value and (key not in found or pos > found[key][0]):
+                                found[key] = [pos, value]
+                if not cached and len(found) == len(EXEC_SETTING_FIELDS):
+                    break
+            if read_to is not None:
+                box.cache_rollout(box.settings_path, "latest", dict(source=source, size=size,
+                                  offset=read_to, mtime=st.st_mtime_ns, settings=found))
+    except OSError:
+        return {}
+    return {key: item[1] for key, item in found.items()}
+
+
+def rollout_usage(rows, turn_id, partial, cached=None):
+    """Token counts have no turn id. Attribute them within turn boundaries and subtract cumulative totals."""
+    session = {}
+    empty = {} if partial else {name: 0 for name in USAGE_FIELDS.values()}
+    truncated_turn = partial
+    active = selected = None
+    baseline, usage = {}, {}
+    start = None
+    closed = False
+    if cached:
+        active = selected = turn_id
+        start, baseline, usage = cached["start"], cached["baseline"], dict(cached["usage"])
+        session = usage.get("session", {})
+        truncated_turn = False
+    for pos, kind, p in rows:
+        event, tid = p.get("type"), p.get("turn_id")
+        if kind == "turn_context" or event == "task_started":
+            if not tid:
+                continue
+            truncated_turn = False
+            if tid != active:
+                if turn_id and selected and tid != turn_id:
+                    closed = True
+                    break
+                if (not turn_id or tid == turn_id) and tid != selected:
+                    selected = tid
+                    # A context in a truncated tail may belong to a turn already in progress.
+                    known_start = event == "task_started" or not partial
+                    start = pos if known_start else None
+                    baseline = (session or empty) if known_start else {}
+                    usage = {"session": session} if known_start and session else {}
+                active = tid
+            if event == "task_started" and tid == selected and start is None:
+                start, baseline = pos, session or empty
+                if session:
+                    usage["session"] = session
+            if kind == "turn_context" and active == selected:
+                for key in ("model", "effort"):
+                    if isinstance(p.get(key), str) and p[key]:
+                        usage[key] = p[key]
+        elif event in ("task_complete", "turn_aborted"):
+            # A tail can contain the last token sample and end of a turn, but no start.
+            if truncated_turn and tid and (not turn_id or tid == turn_id):
+                selected = tid
+                usage = {"session": session} if session else {}
+            if turn_id and tid == turn_id:
+                closed = True
+                break
+            truncated_turn = False
+            if not tid or tid == active:
+                active = None
+        elif event == "token_count":
+            counts = rollout_counts(p)
+            if not counts:
+                continue
+            session = counts
+            if active and active == selected:
+                usage["session"] = counts
+                turn = {name: count - baseline[name] for name, count in counts.items()
+                        if name in baseline and count >= baseline[name]}
+                if turn:
+                    usage["turn"] = turn
+                else:
+                    usage.pop("turn", None)
+    return usage, {"start": start, "baseline": baseline, "usage": usage, "closed": closed}
+
+
+def rollout_activity(rows, turn_id, partial):
+    """Summarize the requested turn's visible activity."""
     msgs, cmds, files, mcp = [], [], [], []
     ncmd = compactions = 0
     began = False
-    for raw in lines:
-        if turn_id.encode() not in raw:
-            continue
-        try:
-            o = json.loads(raw.decode("utf-8", "replace"))
-        except ValueError:
-            continue
-        p = o.get("payload") if isinstance(o, dict) else None
-        if not isinstance(p, dict) or o.get("type") != "event_msg" or p.get("turn_id") != turn_id:
+    for _, kind, p in rows:
+        if kind != "event_msg" or p.get("turn_id") != turn_id:
             continue
         if p.get("type") == "task_started":
             began = True
@@ -359,12 +608,12 @@ def rollout_progress(sid, turn_id):
         out["mcp_calls"] = len(mcp)
     if compactions:
         out["compactions"] = compactions
-    if start and not began:
+    if partial and not began:
         out["partial"] = True  # the turn began before the part of the file that was read
     return out
 
 
-def progress_snapshot(sid, events, info, now):
+def progress_snapshot(box, events, info, now):
     """A working session's progress: from the hook log, plus Codex's own record (best effort)."""
     main = [e for e in events if not e.get("sub")]
     ups = [e for e in main if e.get("ev") == "UserPromptSubmit"]
@@ -376,9 +625,8 @@ def progress_snapshot(sid, events, info, now):
             "tool_calls": sum(1 for e in tm if e.get("ev") == "PostToolUse"),
             "model_requests": sum(1 for e in tm if e.get("ev") == "PostModelRequest"),
             "failed_requests": sum(1 for e in tm if e.get("ev") == "PostModelRequest" and e.get("status") == "failed")}
-    activity = rollout_progress(sid, snap["turn_id"])
-    if activity:
-        snap["activity"] = activity
+    if snap["turn_id"]:
+        snap.update(rollout_snapshot(box, snap["turn_id"], include_activity=True))
     return snap
 
 
@@ -499,6 +747,8 @@ class Session(object):
         self.state_path = os.path.join(self.root, "state.json")
         self.events_path = os.path.join(self.root, "events.jsonl")
         self.rec_path = os.path.join(self.root, "session.json")
+        self.usage_path = os.path.join(self.root, "rollout-usage.json")
+        self.settings_path = os.path.join(self.root, "rollout-settings.json")
         self.lock_path = os.path.join(self.root, ".lock")
 
     def ensure(self):
@@ -527,6 +777,19 @@ class Session(object):
             r = self.record()
             fn(r)
             self.save_record(r)
+
+    def cache_rollout(self, path, key, entry):
+        try:
+            with self.locked():
+                entries = read_json(path, {}) or {}
+                older = entries.get(key)
+                if older and older["source"] == entry["source"] and older["offset"] > entry["offset"]:
+                    return  # a concurrent reader had more of the same rollout
+                entries.pop(key, None)
+                entries[key] = entry
+                write_json_atomic(path, dict(list(entries.items())[-KEEP_USAGE_TURNS:]))
+        except OSError:
+            pass  # telemetry remains available when the cache cannot be written
 
     def is_managed(self, now=None):
         """Owned by an active manager: the gate refuses App popup questions. A mark left by the
@@ -622,17 +885,20 @@ class Session(object):
 
 # ---------------------------------------------------------------------------- stop detection
 
-def analyze(events, now, cfg=None):
-    """State of the session's latest turn (from its last UserPromptSubmit on). Returns (stopped, info).
+def analyze(events, now, cfg=None, after=None, exec_exited=False):
+    """State of the latest turn, scoped by its prompt or the exec launch boundary. Returns (stopped, info).
     A stop's info carries `reason` and `t`: a time that stays the same for that stop while nothing
     new happens, so it can be compared with the report cursor."""
     cfg = cfg or DEFAULT_CFG
-    if not events:
-        return True, {"reason": "unknown", "t": None,
-                      "summary": "没有这个 session 的 hook 事件记录（hooks 未生效，或安装后它还没运行过）"}
     main = [e for e in events if not e.get("sub")]
     starts = [e["t"] for e in main if e.get("ev") == "UserPromptSubmit"]
-    seg = [e for e in events if e["t"] >= starts[-1]] if starts else list(events)
+    if after is not None:
+        seg = [e for e in events if e["t"] > after]
+    else:
+        seg = [e for e in events if e["t"] >= starts[-1]] if starts else events
+    if not seg:
+        return True, {"reason": "unknown", "t": None,
+                      "summary": "没有这个 session 的 hook 事件记录（hooks 未生效，或安装后它还没运行过）"}
     seg_main = [e for e in seg if not e.get("sub")]
     answered = {e.get("tool_use_id") for e in main if e.get("ev") == "PostToolUse" and e.get("tool_use_id")}
 
@@ -661,10 +927,9 @@ def analyze(events, now, cfg=None):
             return True, {"reason": "interrupted", "turn_id": e.get("turn"), "t": e["t"], "at": ts_iso(e["t"]),
                           "summary": "Codex 本轮被中断"}
         if ev == "SessionEnd":
-            info = {"reason": "ended", "t": e["t"], "at": ts_iso(e["t"]),
-                    "summary": "codex exec 进程已退出，本轮没有正常结束" if e.get("exec_exit") else "Codex 会话已结束"}
-            if e.get("exec_log"):
-                info["exec_log"] = e["exec_log"]
+            info = {"reason": "ended", "t": e["t"], "at": ts_iso(e["t"]), "summary": "Codex 会话已结束"}
+            if e.get("turn"):
+                info["turn_id"] = e["turn"]
             return True, info
         if (ev == "PreToolUse" and e.get("tool") == ASK_TOOL and not e.get("denied")
                 and e.get("tool_use_id") not in answered):
@@ -693,7 +958,7 @@ def analyze(events, now, cfg=None):
         lm.get("ev") == "PostModelRequest" and lm.get("status") == "completed")
 
     if (lm.get("ev") == "PostModelRequest" and lm.get("status") == "failed"
-            and model_inflight <= 0 and main_silence >= cfg["error_grace"]):
+            and (exec_exited or (model_inflight <= 0 and main_silence >= cfg["error_grace"]))):
         streak = []
         for e in reversed([x for x in tm if x.get("ev") == "PostModelRequest"]):
             if e.get("status") != "failed":
@@ -739,86 +1004,163 @@ def stops_between(main, lo, hi):
                and ((e.get("ev") == "Stop" and not e.get("continued")) or e.get("ev") == "Interrupt"))
 
 
-def exec_end(main, ex):
-    """A synthetic SessionEnd once the exec-transport process is gone (there is no SessionEnd hook):
-    `before_start` if it never started a turn; None if its turn is over and a later one followed."""
-    if not ex or not ex.get("pid") or exec_alive(ex["pid"]):
-        return None
-    started = ex.get("started") or 0
+def exec_completion_hint(path):
+    """Look only for a completion marker in exec JSONL, for the missing-hook diagnostic."""
+    try:
+        with open(path or "", "rb") as f:
+            for line in f:
+                if b'"turn.completed"' not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except (ValueError, UnicodeError):
+                    continue
+                if isinstance(row, dict) and row.get("type") == "turn.completed":
+                    return "exec 日志显示本轮已完成，但 hooks 没有记录到，先跑 doctor"
+    except OSError:
+        pass
+    return ""
+
+
+def terminal_hook(event):
+    return event.get("ev") in ("Interrupt", "SessionEnd") or (
+        event.get("ev") == "Stop" and not event.get("continued"))
+
+
+def exec_end(ex, recent, prompt):
+    """Summarize an exited run whose hooks have no terminal event."""
     try:
         mtime = os.path.getmtime(ex.get("log") or "")
     except OSError:
-        mtime = started
-    ups = [e for e in main if e.get("ev") == "UserPromptSubmit" and e["t"] > started]  # its turn starts after spawn
-    if not ups:
-        return {"t": round(max(mtime, started), 3), "ev": "SessionEnd", "exec_exit": True, "before_start": True,
-                "exec_log": tilde(ex.get("log"))}
-    first = ups[0]
-    if any(e.get("turn") != first.get("turn") for e in ups[1:]):
-        return None
-    last = max(e["t"] for e in main if e["t"] >= first["t"])
-    return {"t": round(max(mtime, last) + 0.001, 3), "ev": "SessionEnd", "exec_exit": True,
-            "exec_log": tilde(ex.get("log"))}
+        mtime = ex["started"]
+    end = {"exec_log": tilde(ex.get("log"))}
+    hint = exec_completion_hint(ex.get("log"))
+    if prompt:
+        t = round(max(mtime, recent[-1]["t"]) + 0.001, 3)
+        end.update(reason="ended", turn_id=prompt.get("turn"),
+                   summary=hint or "codex exec 进程已退出，本轮没有正常结束")
+    else:
+        t = round(max(mtime, ex["started"]), 3)
+        end.update(reason="not_started", exec_exit=True,
+                   summary=hint or "codex exec 进程退出了，发出的消息没有开始处理")
+    return dict(end, t=t, at=ts_iso(t))
 
 
-def current(rec, events, now, cfg):
-    """analyze() of the latest turn, counting an exec run that died mid-turn as its end."""
-    end = exec_end([e for e in events if not e.get("sub")], rec.get("exec"))
-    evs = sorted(events + [end], key=lambda e: e["t"]) if end and not end.get("before_start") else events
-    stopped, info = analyze(evs, now, cfg)
-    return stopped, info, end
+def current(rec, read_events, now, cfg):
+    """Analyze the latest turn from a snapshot taken after any observed exec exit."""
+    events = read_events()
+    ex = rec.get("exec")
+    reported_end = (ex or {}).get("reported_end")
+    exited = bool(reported_end)
+    if not exited and ex and ex.get("pid") and not exec_alive(ex["pid"]):
+        # Stop and UserPromptSubmit are synchronous: an exiting process may have just written them.
+        events = read_events()
+        exited = True
+    main = [e for e in events if not e.get("sub")]
+    launch = (ex or {}).get("started")
+    recent = [e for e in main if e["t"] > launch] if launch is not None else []
+    latest_prompt = next((e for e in reversed(recent) if e.get("ev") == "UserPromptSubmit"), None)
+    # A Stop can be the only evidence of the exec turn, even before its process exits.
+    first = next((e for e in recent if e.get("ev") == "UserPromptSubmit" or terminal_hook(e)), None)
+    prompt = first if first and first.get("ev") == "UserPromptSubmit" else None
+    superseded = bool(latest_prompt and (not prompt or latest_prompt.get("turn") != prompt.get("turn")))
+    if reported_end and latest_prompt:
+        superseded = reported_end["reason"] == "not_started" or latest_prompt.get("turn") != reported_end.get("turn_id")
+    # Older installs can log SessionEnd. The notified exec exit already covers it, but a final
+    # Stop must still be visible even when that SessionEnd is first in the snapshot.
+    covered_ends = []
+    if reported_end and reported_end["reason"] == "ended" and not superseded:
+        covered_ends = [e for e in recent if e.get("ev") == "SessionEnd"
+                        and e.get("turn") in (None, reported_end.get("turn_id"))]
+    terminal = next((e for e in recent if terminal_hook(e) and e not in covered_ends and (
+        not prompt or (e["t"] >= prompt["t"] and e.get("turn") in (None, prompt.get("turn"))))), None)
+    end = None
+    if exited and launch is not None and not terminal and not superseded and not ex.get("terminal_reported"):
+        end = reported_end or exec_end(ex, recent, prompt)
+    analyzed = [e for e in events if e not in covered_ends] if covered_ends else events
+    stopped, info = analyze(analyzed, now, cfg, after=launch if terminal and not latest_prompt else None,
+                            exec_exited=bool(end and prompt))
+    if end and end["reason"] == "ended" and (not prompt or info["reason"] not in ("error", "asking")):
+        stopped, info = True, end
+    if reported_end and reported_end["reason"] == "not_started" and superseded:
+        prompt = terminal = None
+    return {"stopped": stopped, "info": info, "exec_end": end, "exec_exited": exited,
+            "exec_start": prompt or terminal, "exec_terminal": terminal, "main": main, "events": events}
 
 
-def assess(box, rec, events, now, cfg, queue):
+def assess(box, rec, read_events, now, cfg, queue):
     """Everything listen / list / status need about one session. `queue`: Codex's queue store as
     {item id: session id}, or None when unreadable (then a send counts as started on the next
     UserPromptSubmit alone). Returns a dict:
       stopped, info   analyze() of the latest turn
-      waiting         sends that have not started a turn yet; started: those that have
+      waiting         sends that still need a start notification; started: those that have started
       attention       what listen reports to the owner right now, or None
       exec_end        the synthetic end of a finished exec run, if any"""
-    main = [e for e in events if not e.get("sub")]
-    prompts = [e["t"] for e in main if e.get("ev") == "UserPromptSubmit"]
+    state = current(rec, read_events, now, cfg)
+    main, end = state["main"], state["exec_end"]
+    stopped, info = state["stopped"], state["info"]
+    ex = rec.get("exec") or {}
+    expects = rec.get("expect") or []
+    exec_id = ex.get("send_id")
+    if ex.get("started") is not None and not exec_id:  # older exec records lack the send id
+        exec_id = next((x["id"] for x in reversed(expects)
+                        if x.get("transport") == "exec" and x["t"] <= ex["started"]), None)
+    exec_send = next((x for x in expects if x.get("id") == exec_id), None)
+    if (exec_send and queue is not None and exec_send.get("qid") in queue
+            and (state["exec_start"] or state["exec_exited"])):
+        queue = codex_queue_map()  # an auto fallback may have drained it since the first read
+    prompts = [e for e in main if e.get("ev") == "UserPromptSubmit"]
     waiting, started = [], []
-    for x in rec.get("expect") or []:
-        in_queue = bool(x.get("qid")) and queue is not None and x["qid"] in queue
-        if not x.get("queuing") and not in_queue and any(t > x["t"] for t in prompts):
-            started.append(x)
-        else:
+    for x in expects:
+        start = None
+        if not x.get("queuing") and (queue is None or x.get("qid") not in queue):
+            start = (state["exec_start"] if x is exec_send else
+                     next((p for p in prompts if p["t"] > x["t"]), None))
+        if start:
+            started.append((x, start))
+        elif not x.get("not_started_reported"):
             waiting.append(x)
-    stopped, info, end = current(rec, events, now, cfg)
+
     reported = rec.get("reported") or 0
     att = None
-    if waiting:  # a send of ours has not started: the session's current state isn't the answer
-        first = min(x["t"] for x in waiting)
-        ex = rec.get("exec") or {}
-        if end and end.get("before_start") and (ex.get("started") or 0) >= first - 1:
-            att = {"reason": "not_started", "t": end["t"], "at": ts_iso(end["t"]), "exec_exit": True,
-                   "exec_log": end.get("exec_log"), "summary": "codex exec 进程退出了，发出的消息没有开始处理"}
-        elif now - first >= cfg["start_timeout"]:
+    # A later queued send cannot be answered by an old stop. A stop tied to an earlier send
+    # of ours can still be reported in its own right while the later send waits.
+    if stopped and info is not end and (t := info.get("t")) is not None and t > reported:
+        covered = [(x, start) for x, start in started if start["t"] <= t]
+        if not waiting or any(start.get("turn") == info.get("turn_id") for _, start in covered):
+            att = dict(info, _cursor=t, _drop=[x["id"] for x, _ in covered])
+            if state["exec_terminal"] and state["exec_terminal"]["t"] == t:
+                att["_exec_update"] = (ex, {"terminal_reported": True})
+            n = stops_between(main, reported, t)
+            if n:
+                att["earlier_stops"] = n
+    if att is None and info is end and end and end["reason"] == "ended" and not ex.get("reported_end"):
+        att = dict(end, _exec_update=(ex, {"reported_end": end}))
+    if att is None and waiting:
+        expired = [x for x in waiting if now - x["t"] >= cfg["start_timeout"]]
+        if end and end["reason"] == "not_started" and exec_send in waiting and not ex.get("reported_end"):
+            expired = [exec_send]
+            att = dict(end, _exec_update=(ex, {"reported_end": end}))
+        elif expired:
+            first = min(x["t"] for x in expired)
             t = round(first + cfg["start_timeout"], 3)
             att = {"reason": "not_started", "t": t, "at": ts_iso(t),
                    "summary": "%d 秒内 Codex 没有开始处理发出的消息" % (now - first)}
         if att:
+            att["_not_started"] = [x["id"] for x in expired]
             att["queued"] = [{"id": x.get("id"), "preview": x.get("preview"), "transport": x.get("transport")}
-                             for x in waiting]
+                             for x in expired]
             att["codex_queue"] = queued_count(queue, box.sid)
             if stopped and info.get("reason") != "unknown":  # what holds it up, e.g. approval / asking
                 att["session_state"] = {"reason": info["reason"], "summary": info.get("summary")}
             blocked = blocking_popups(main)
             if blocked:
                 att["blocked_by_question"] = flat_questions(blocked)
-    elif stopped and info.get("t") and info["t"] > reported:
-        att = dict(info)
-        n = stops_between(main, reported, info["t"])
-        if n:
-            att["earlier_stops"] = n
     if att is not None:
         undelivered = box.inbox_messages()
         if undelivered:
             att["undelivered"] = [{"id": m["id"], "preview": clip(m.get("text", ""), 80)} for m in undelivered]
-    return {"stopped": stopped, "info": info, "waiting": waiting, "started": started, "attention": att,
-            "exec_end": end}
+    return dict(state, waiting=waiting, started=[x for x, _ in started], attention=att, queue=queue)
 
 
 # ---------------------------------------------------------------------------- hook side
@@ -1065,7 +1407,7 @@ def cmd_hook(args):
 
 # ---------------------------------------------------------------------------- ownership
 
-def claim(box, mgr, take_over=False, label=None, checkin=None):
+def claim(box, mgr, take_over=False, label=None, checkin=None, first_exec=None, settings=None):
     """Make `mgr` the owner of the session. Returns (ok, info). An active other owner is refused
     unless take_over; a lapsed one (no activity for MANAGED_TTL, no listener) is replaced."""
     now = time.time()
@@ -1088,12 +1430,23 @@ def claim(box, mgr, take_over=False, label=None, checkin=None):
                 info["previous_owner"] = cur  # lapsed
         if cur != mgr.id:
             # A new owner starts fresh: earlier stops and the previous owner's sends are not its news.
-            rec.update({"manager": mgr.id, "since": now_iso(), "reported": now, "expect": []})
+            reported = first_exec["run"]["started"] if first_exec else now
+            rec.update({"manager": mgr.id, "since": now_iso(), "reported": reported, "expect": []})
             info["claimed"] = True
         if label:
             rec["label"] = label
         if checkin is not None:
             rec["checkin"] = checkin
+        if settings:
+            rec.setdefault("exec_settings", {}).update(settings)
+        if first_exec:
+            # Publish ownership, the first prompt expectation and its exec run in one write.
+            run = first_exec["run"]
+            dest = os.path.join(box.root, os.path.basename(run["log"]))
+            os.replace(run["log"], dest)
+            run["log"] = dest
+            rec["exec"] = run
+            rec["expect"] = (rec["expect"] + [first_exec["expect"]])[-KEEP_EXPECT:]
         box.save_record(rec)
         box.drop_legacy_mark()
     mgr.add(box.sid)
@@ -1153,12 +1506,42 @@ def run_codex_queue(codex, sid, text):
     return proc.returncode, out, m.group(1) if m else None
 
 
-def start_exec(box, codex, prompt, watch_s=15.0):
+def requested_exec_settings(args):
+    return {key: value for key in EXEC_SETTING_FIELDS if (value := getattr(args, key)) is not None}
+
+
+def exec_setting_flags(settings):
+    flags = []
+    if "model" in settings:
+        flags += ["-m", settings["model"]]
+    if "effort" in settings:
+        flags += ["-c", "model_reasoning_effort=" + json.dumps(settings["effort"], ensure_ascii=False)]
+    return flags
+
+
+def resolve_exec_settings(box, requested):
+    saved = box.record().get("exec_settings", {})
+    history = {} if all(key in requested or key in saved for key in EXEC_SETTING_FIELDS) else rollout_settings(box)
+    resolved = {}
+    for key in EXEC_SETTING_FIELDS:
+        for source, values in (("explicit", requested), ("session", saved), ("rollout", history)):
+            if key in values:
+                resolved[key] = {"value": values[key], "source": source}
+                break
+        else:
+            resolved[key] = {"value": None, "source": "config"}
+    return resolved
+
+
+def start_exec(box, codex, prompt, settings, watch_s=15.0):
     """Run `codex exec resume <sid> <prompt>` detached, in the session's working directory. Returns
     once it is clearly running (or failed). The App holding the session shows up as active_writer."""
     cwd = box.last_cwd()
     if not cwd or not os.path.isdir(cwd):
         return {"ok": False, "error": "不知道这个 session 的工作目录（%s），无法用 exec 运行" % cwd}
+    resolved = resolve_exec_settings(box, settings)
+    flags = exec_setting_flags({key: item["value"] for key, item in resolved.items() if item["value"] is not None})
+    argv = [codex, "exec", "resume", "--json", "--skip-git-repo-check", *flags, box.sid, prompt]
     box.ensure()
     logs = sorted(glob.glob(os.path.join(box.root, "exec-*.log")))
     for old in logs[:max(0, len(logs) - KEEP_EXEC_LOGS + 1)]:
@@ -1169,10 +1552,10 @@ def start_exec(box, codex, prompt, watch_s=15.0):
     log = os.path.join(box.root, "exec-%s.log" % datetime.now().strftime("%Y%m%d-%H%M%S"))
     t_spawn = time.time()
     with open(log, "wb") as lf:
-        p = subprocess.Popen([codex, "exec", "resume", "--json", "--skip-git-repo-check", box.sid, prompt],
-                             cwd=cwd, stdin=subprocess.DEVNULL, stdout=lf, stderr=subprocess.STDOUT,
-                             start_new_session=True)
-    running = {"ok": True, "exec_pid": p.pid, "exec_log": tilde(log), "cwd": cwd, "_log": log, "_started": t_spawn}
+        p = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=lf, stderr=subprocess.STDOUT,
+                             start_new_session=True, env=dict(os.environ, CODEX_INTERCOM_DIR=box.base))
+    running = {"ok": True, "exec_pid": p.pid, "exec_log": tilde(log), "cwd": cwd, "exec_settings": resolved,
+               "_log": log, "_started": t_spawn}
     while time.time() - t_spawn < watch_s:
         rc = p.poll()
         if rc is not None:
@@ -1206,24 +1589,129 @@ def expect_drop(box, xid):
     box.edit_record(lambda rec: rec.update(expect=[x for x in rec["expect"] if x.get("id") != xid]))
 
 
-def record_exec(box, r):
-    """Remember the exec-transport run, so its end can be told (there is no SessionEnd hook)."""
-    box.edit_record(lambda rec: rec.update(exec={"pid": r["exec_pid"], "started": r["_started"], "log": r["_log"]}))
+def record_exec(box, r, send_id=None):
+    """Publish the exec run and its send together, so listen can attribute its hooks."""
+    def fn(rec):
+        rec["exec"] = {"pid": r["exec_pid"], "started": r["_started"], "log": r["_log"], "send_id": send_id}
+        for expect in rec["expect"]:
+            if expect["id"] == send_id:
+                expect.pop("queuing", None)
+                expect["transport"] = "exec"
+    box.edit_record(fn)
 
 
-def deliver_stopped(box, args, msg, result):
+def wait_for_thread(proc, log, timeout):
+    """Read the exec startup JSONL. A complete thread.started already on disk wins over process exit."""
+    deadline = time.monotonic() + timeout
+    with open(log, "rb") as f:
+        while True:
+            rc = proc.poll()
+            while time.monotonic() < deadline:
+                pos = f.tell()
+                raw = f.readline()
+                if not raw:
+                    break
+                if rc is None and not raw.endswith(b"\n"):
+                    f.seek(pos)
+                    break
+                try:
+                    row = json.loads(raw)
+                except (ValueError, UnicodeError):
+                    continue
+                sid = row.get("thread_id") if isinstance(row, dict) and row.get("type") == "thread.started" else None
+                if isinstance(sid, str) and UUID_RE.fullmatch(sid):
+                    return sid.lower(), None
+            if rc is not None:
+                return None, "codex exec 未返回 thread id 就退出了（退出码 %d）" % rc
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None, "等待 codex exec 返回 thread id 超时（%s）" % span(timeout)
+            time.sleep(min(0.1, remaining))
+
+
+def message_text(args):
+    return args.message if args.message is not None else sys.stdin.read()
+
+
+def send_result(result, mgr):
+    listening = bool(mgr.listener())
+    result["listening"] = listening
+    if result["ok"] and not listening:
+        result["next"] = "这个管理者没有 listen 在运行：用 run_in_background 启动 listen，Codex 停下时会收到通知"
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result["ok"] else 1
+
+
+def cmd_new(args):
+    text = message_text(args)
+    base = base_dir(args.dir)
+    mgr = Manager(base, manager_id(args.manager))
+    cwd = os.path.abspath(os.path.expanduser(args.cwd or os.curdir))
+    result = {"ok": False, "thread": None, "label": args.label, "claimed": False, "manager": mgr.id,
+              "mode": "new", "transport": None, "cwd": cwd, "exec_log": None, "exec_pid": None}
+    if not text.strip():
+        return send_result(dict(result, error="消息不能为空"), mgr)
+    settings = requested_exec_settings(args)
+    argv = [args.codex, "exec", "--json", *exec_setting_flags(settings)]
+    if args.search:
+        argv += ["-c", 'web_search="live"']
+    # A bare "-" asks Codex to read stdin. Keep it as prompt text even in that case.
+    argv += ["--skip-git-repo-check", "-C", cwd, "--", text if text != "-" else "-\n"]
+
+    log_dir = os.path.join(base, NEW_EXEC_DIR)
+    log = os.path.join(log_dir, "exec-%s-%s.log" % (datetime.now().strftime("%Y%m%d-%H%M%S"), uuid.uuid4().hex))
+    proc = run = None
+    try:
+        os.makedirs(base, mode=0o700, exist_ok=True)
+        os.makedirs(log_dir, mode=0o700, exist_ok=True)
+        with open(log, "xb") as lf:
+            # Hooks round their timestamps to milliseconds. Use a strict lower bound before spawn.
+            started = round(time.time(), 3) - 0.001
+            proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=lf, stderr=subprocess.STDOUT,
+                                    start_new_session=True, env=dict(os.environ, CODEX_INTERCOM_DIR=base))
+        sid, error = wait_for_thread(proc, log, NEW_START_TIMEOUT)
+        result.update(thread=sid, exec_pid=proc.pid, exec_log=tilde(log))
+        if sid:
+            xid = "%d-%s" % (time.time_ns(), uuid.uuid4().hex[:6])
+            run = {"pid": proc.pid, "started": started, "log": log, "send_id": xid}
+            first_exec = {"run": run,
+                          "expect": {"id": xid, "t": started, "preview": clip(text, 80), "transport": "exec"}}
+            ok, own = claim(Session(base, sid), mgr, label=args.label, checkin=args.checkin,
+                            first_exec=first_exec, settings=settings)
+            result.update(own)
+            if ok:
+                result.update(ok=True, id=xid, transport="exec", exec_log=tilde(run["log"]))
+        else:
+            result["error"] = error
+    except (OSError, ValueError) as e:
+        result["error"] = "无法新建 Codex session：%s" % e
+    finally:
+        if proc is not None and not result["ok"]:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+    if not result["ok"]:
+        log = run["log"] if run else log
+        result.update(exec_pid=proc.pid if proc else None, exec_log=tilde(log) if os.path.isfile(log) else None,
+                      log_tail=tail_lines(log, 20))
+    rc = send_result(result, mgr)
+    return 2 if result.get("error") == "owned_by_another_manager" else rc
+
+
+def deliver_stopped(box, args, msg, result, settings):
     """Session is stopped: hand the message to the App via codex queue, or run it with exec. The
     send is recorded first, so until its turn starts the session's old stop isn't taken as the answer."""
     sid, text, xid = box.sid, msg["text"], msg["id"]
     box.edit_record(lambda rec: rec.update(expect=(rec["expect"] + [
         {"id": xid, "t": time.time(), "preview": clip(text, 80), "queuing": True}])[-KEEP_EXPECT:]))
     if args.via == "exec":
-        r = start_exec(box, args.codex, text)
+        r = start_exec(box, args.codex, text, settings)
         result.update({k: v for k, v in r.items() if not k.startswith("_")})
         result.update(mode="exec", transport="exec" if r.get("ok") else None)
         if r.get("ok"):
-            record_exec(box, r)
-            expect_set(box, xid, queuing=None, transport="exec")
+            record_exec(box, r, xid)
         else:
             expect_drop(box, xid)
             if r.get("active_writer"):
@@ -1253,13 +1741,13 @@ def deliver_stopped(box, args, msg, result):
             result["transport"] = "app"
             return True
         time.sleep(0.5)
-    r = start_exec(box, args.codex, EXEC_NUDGE)
+    r = start_exec(box, args.codex, EXEC_NUDGE, settings)
     if r.get("active_writer"):
         result.update(transport="app", note="App 打开着这个 session 但还没取走消息，它空下来就会处理")
     elif r.get("ok"):
-        record_exec(box, r)
-        expect_set(box, xid, transport="exec")
-        result.update(transport="exec", exec_pid=r.get("exec_pid"), exec_log=r.get("exec_log"), cwd=r.get("cwd"))
+        record_exec(box, r, xid)
+        result.update(transport="exec", exec_pid=r["exec_pid"], exec_log=r["exec_log"], cwd=r["cwd"],
+                      exec_settings=r["exec_settings"])
     else:
         result.update(transport="queued", exec_error=r.get("error"),
                       note="App 没有处理，exec 也没能启动；消息留在 Codex 队列里，App 打开这个 session 时会处理")
@@ -1268,13 +1756,14 @@ def deliver_stopped(box, args, msg, result):
 
 def cmd_send(args):
     sid = parse_thread(args.thread)
-    text = args.message if args.message is not None else sys.stdin.read()
+    text = message_text(args)
     if not text.strip():
         sys.exit("error: empty message")
     cfg = cfg_from(args)
     base = base_dir(args.dir)
     box, mgr = Session(base, sid), Manager(base, manager_id(args.manager))
-    ok, own = claim(box, mgr, args.take_over, args.label, args.checkin)
+    settings = requested_exec_settings(args)
+    ok, own = claim(box, mgr, args.take_over, args.label, args.checkin, settings=settings)
     if not ok:
         print(json.dumps(own, ensure_ascii=False))
         return 2
@@ -1287,17 +1776,15 @@ def cmd_send(args):
     if not args.queue:
         with box.locked():
             if (box.state().get("status") == "working"
-                    and not current(box.record(), box.events(), time.time(), cfg)[0]):
+                    and not current(box.record(), box.events, time.time(), cfg)["stopped"]):
                 box.put(msg)
                 steered = True
                 result.update({"mode": "steer", "ok": True, "turn_id": box.state().get("turn_id")})
-    ok = True if steered else deliver_stopped(box, args, msg, result)
-    listening = bool(mgr.listener())
-    result["listening"] = listening
-    if ok and not listening:
-        result["next"] = "这个管理者没有 listen 在运行：用 run_in_background 启动 listen，Codex 停下时会收到通知"
-    print(json.dumps(result, ensure_ascii=False))
-    return 0 if ok else 1
+    if not steered:
+        deliver_stopped(box, args, msg, result, settings)
+    if settings and result.get("transport") != "exec":
+        result["ignored_exec_options"] = ["--" + key for key in settings]
+    return send_result(result, mgr)
 
 
 # ---------------------------------------------------------------------------- listening
@@ -1333,18 +1820,16 @@ def scan(base, mgr, cfg, logs, now, default_checkin=DEFAULT_CHECKIN):
         log = logs.get(sid)
         if log is None:
             log = logs[sid] = EventLog(box.events_path)
-        events = log.read()
-        a = assess(box, rec, events, now, cfg, queue() if rec["expect"] else None)
-        if a["attention"]:
-            item = dict(head)
-            item.update(a["attention"])
-            item["_drop"] = [x.get("id") for x in a["started"]]
-            if a["attention"]["reason"] == "not_started":
-                item["_drop"] += [x.get("id") for x in a["waiting"]]
-            item["_exec_over"] = bool(a["exec_end"])
-            reports.append(item)
-        elif a["waiting"]:
-            watching.append(dict(head, state="waiting_start", since=ts_iso(min(x["t"] for x in a["waiting"])),
+        a = assess(box, rec, log.read, now, cfg, queue() if rec["expect"] else None)
+        events = a["events"]
+        att = a["attention"]
+        waiting = a["waiting"]
+        if att:
+            reports.append(dict(head, **att))
+            notified = set(att.get("_not_started", ()))
+            waiting = [x for x in waiting if x["id"] not in notified]
+        if waiting:
+            watching.append(dict(head, state="waiting_start", since=ts_iso(min(x["t"] for x in waiting)),
                                  _interval=0, _elapsed=0))
         elif not a["stopped"]:
             starts = [e["t"] for e in events if not e.get("sub") and e.get("ev") == "UserPromptSubmit"]
@@ -1358,9 +1843,7 @@ def scan(base, mgr, cfg, logs, now, default_checkin=DEFAULT_CHECKIN):
 
 
 def commit(base, mgr, reports, lost, progress=(), at=None):
-    """After printing: advance each reported session's cursor to the stop that was reported (later
-    stops stay reportable), drop sends that have started (or were reported as not started), and
-    restart the check-in clock of the sessions whose progress was reported."""
+    """After printing: acknowledge hook reports on the cursor and synthetic reports on their records."""
     for it in progress:
         Session(base, it["thread"]).edit_record(lambda rec: rec.update(checked=at or time.time()))
     for it in reports:
@@ -1369,12 +1852,18 @@ def commit(base, mgr, reports, lost, progress=(), at=None):
             rec = box.record()
             if rec.get("manager") != mgr.id:
                 continue
-            if it.get("t"):
-                rec["reported"] = max(rec.get("reported") or 0, it["t"])
-            drop = set(it.get("_drop") or [])
-            rec["expect"] = [x for x in rec["expect"] if x.get("id") not in drop]
-            if it.get("_exec_over") and rec.get("exec") and not exec_alive(rec["exec"].get("pid")):
-                rec["exec"] = None
+            cursor = it.get("_cursor")
+            if cursor is not None:
+                rec["reported"] = max(rec.get("reported") or 0, cursor)
+                drop = set(it.get("_drop", ()))
+                rec["expect"] = [x for x in rec["expect"] if x["id"] not in drop]
+            timed_out = set(it.get("_not_started", ()))
+            for expect in rec["expect"]:
+                if expect["id"] in timed_out:
+                    expect["not_started_reported"] = True
+            exec_update = it.get("_exec_update")
+            if exec_update and rec.get("exec") == exec_update[0]:
+                rec["exec"].update(exec_update[1])
             box.save_record(rec)
     if lost:
         mgr.remove([l["thread"] for l in lost])
@@ -1407,13 +1896,18 @@ def listen_loop(base, mgr, cfg, timeout=0, settle=2.0, poll=1.0, checkin=DEFAULT
         if reports or lost or due:
             first = first or now
             if now - first >= settle:  # let stops (and check-ins) that land together come in one report
+                for report in reports:
+                    if report.get("turn_id"):
+                        box = Session(base, report["thread"])
+                        report.update(rollout_snapshot(box, report["turn_id"]))
                 # Waking the manager anyway: bring along every session at least halfway to its check-in.
                 ids = {w["thread"] for w in working if w["_interval"] and w["_elapsed"] >= w["_interval"] / 2}
                 progress = []
                 for w in working:
                     if w["thread"] in ids:
                         item = {k: v for k, v in w.items() if not k.startswith("_") and k not in ("in_flight", "silence_s")}
-                        item.update(progress_snapshot(w["thread"], w["_events"], w["_info"], now))
+                        box = Session(base, w["thread"])
+                        item.update(progress_snapshot(box, w["_events"], w["_info"], now))
                         progress.append(item)
                 rest = [w for w in working if w["thread"] not in ids]
                 parts = ["%s：%s" % (r.get("label") or r["thread"][:8], r["reason"]) for r in reports + lost]
@@ -1485,7 +1979,7 @@ def cmd_list(args):
     for sid in sids:
         box = Session(base, sid)
         rec = box.record()
-        a = assess(box, rec, box.events(), now, cfg, queue)
+        a = assess(box, rec, box.events, now, cfg, queue)
         info = a["info"]
         row = {"thread": sid}
         if rec.get("label"):
@@ -1518,9 +2012,9 @@ def cmd_status(args):
     me = manager_id(args.manager)
     now = time.time()
     rec = box.record()
-    evs = box.events()
     queue = codex_queue_map()
-    a = assess(box, rec, evs, now, cfg_from(args), queue)
+    a = assess(box, rec, box.events, now, cfg_from(args), queue)
+    evs = a["events"]
     info = dict(a["info"], stopped=a["stopped"])
     info.pop("t", None)
     if info.get("last_message"):
@@ -1534,14 +2028,19 @@ def cmd_status(args):
         done = []
     main = [e for e in evs if not e.get("sub")]
     ex = rec.get("exec")
-    print(json.dumps({
+    progress = None if a["stopped"] or a["waiting"] else progress_snapshot(box, evs, a["info"], now)
+    if progress and progress["turn_id"]:
+        usage = progress.pop("usage", None)
+    else:
+        usage = rollout_snapshot(box, info.get("turn_id")).get("usage")
+    out = {
         "thread": sid,
         "label": rec.get("label"),
         "owner": {"manager": owner, "is_me": owner == me, "active": om.active(now, od), "since": rec.get("since"),
                   "listening": bool(om.listener(od))} if owner else None,
         "managed": bool(om and om.active(now, od)),
         "codex": info,
-        "progress": None if a["stopped"] or a["waiting"] else progress_snapshot(sid, evs, a["info"], now),
+        "progress": progress,
         "unreported": public(a["attention"]) if a["attention"] and owner else None,
         "reported_upto": ts_iso(rec.get("reported")),
         "checkin_s": rec.get("checkin"),
@@ -1550,13 +2049,17 @@ def cmd_status(args):
                            "sent_at": ts_iso(x.get("t"))} for x in a["waiting"]],
         "open_questions": flat_questions(open_questions(main)),
         "blocked_by_question": bool(blocking_popups(main)),
-        "exec": dict(ex, alive=pid_alive(ex.get("pid")), log=tilde(ex.get("log"))) if ex else None,
-        "codex_queue": queued_count(queue, sid),
+        "exec": {"pid": ex.get("pid"), "started": ex.get("started"), "log": tilde(ex.get("log")),
+                 "alive": not a["exec_exited"] and bool(ex.get("pid"))} if ex else None,
+        "codex_queue": queued_count(a["queue"], sid),
         "inbox": [{"id": m["id"], "preview": clip(m.get("text", ""), 80)} for m in box.inbox_messages()],
         "recent_delivered": [{k: (box.receipt(n[:-5]) or {}).get(k) for k in ("id", "delivered_via", "delivered_at")}
                              for n in done],
         "state": box.state() or None,
-    }, ensure_ascii=False, indent=2))
+    }
+    if usage:
+        out["usage"] = usage
+    print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -1604,7 +2107,16 @@ def cmd_gc(args):
                 os.remove(m.lock_path)
             except OSError:
                 pass
-    print(json.dumps({"removed": removed, "managers_removed": managers, "legacy_files_removed": legacy}))
+    new_logs = 0
+    for path in glob.glob(os.path.join(base, NEW_EXEC_DIR, "exec-*.log")):
+        try:
+            if os.path.getmtime(path) < min(cutoff, time.time() - NEW_START_TIMEOUT - 1):
+                os.remove(path)
+                new_logs += 1
+        except OSError:
+            pass
+    print(json.dumps({"removed": removed, "managers_removed": managers, "legacy_files_removed": legacy,
+                      "new_exec_logs_removed": new_logs}))
     return 0
 
 
@@ -1818,8 +2330,8 @@ def cmd_doctor(args):
     if args.thread:
         sid = parse_thread(args.thread)
         box = Session(base, sid)
-        evs = box.events()
-        a = assess(box, box.record(), evs, time.time(), DEFAULT_CFG, codex_queue_map())
+        a = assess(box, box.record(), box.events, time.time(), DEFAULT_CFG, codex_queue_map())
+        evs = a["events"]
         info = dict(a["info"], stopped=a["stopped"])
         info.pop("last_message", None)
         info.pop("t", None)
@@ -1870,9 +2382,22 @@ def main(argv=None):
                                      "else 'cli')")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    s = sub.add_parser("new", help="start a Codex session with its first message in a detached exec, and claim it")
+    s.add_argument("--message", help="first message (default: read stdin)")
+    s.add_argument("--label", help="short name for this session, shown by listen / list")
+    s.add_argument("--model", help="model (default: Codex config), saved as this session's exec default")
+    s.add_argument("--effort", help="reasoning effort (default: Codex config), saved as this session's exec default")
+    s.add_argument("--cwd", help="working directory (default: current directory)")
+    s.add_argument("--search", action="store_true", help="enable live web search")
+    s.add_argument("--checkin", type=parse_duration, help="as for send")
+    s.add_argument("--codex", default=shutil.which("codex") or "codex", help="codex executable")
+    s.set_defaults(fn=cmd_new)
+
     s = sub.add_parser("send", help="send a message and claim the session (steer if working, else queue / exec)")
     s.add_argument("--thread", required=True, help="session UUID or codex://threads/<uuid>")
     s.add_argument("--message", help="message text (default: read stdin)")
+    s.add_argument("--model", help="model for exec resume, saved as this session's exec default")
+    s.add_argument("--effort", help="reasoning effort for exec resume, saved as this session's exec default")
     s.add_argument("--from", dest="sender", default=None, help="optional sender label shown to the model")
     s.add_argument("--label", help="short name for this session, shown by listen / list")
     s.add_argument("--take-over", dest="take_over", action="store_true",

@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - 2026-11-19
+
+### Added
+
+- `new` starts the first turn of a Codex session in a detached exec and claims its thread for `listen`.
+- `status` and `listen` report the model, reasoning effort, and token usage from the Codex rollout when available.
+- `send` preserves per-session model and reasoning effort on exec resume, with `--model` and `--effort` overrides and JSON reporting of their sources.
+- Skill guidance: long tasks go in a file with a one-line pointer message, Codex keeps its final reply short, and waiting never uses polling or scheduled wake-ups.
+
+### Fixed
+
+- Exec resume no longer runs on the `config.toml` default model and reasoning effort instead of the session's own
+  (`codex exec resume` ignores the saved settings; [openai/codex#32061](https://github.com/openai/codex/issues/32061)).
+- `listen` preserves real stops and their last replies across queued sends, start timeouts, and exec exits.
+- `new` and exec resume write hooks to the same data directory, including when `--dir` is relative.
+- Cached rollout settings and turn usage survive appends larger than the initial lookup window.
+
 ## [1.0.0] - 2026-11-13
 
 First public release.
@@ -27,4 +44,5 @@ First public release.
 - `list`, `status`, `claim`, `release`, `doctor`, `install`, `uninstall`, `gc`.
 - `install.sh` / `uninstall.sh`, Claude Code plugin marketplace manifest, CI on Linux and macOS.
 
+[1.1.0]: https://github.com/MagicGeekSquad/codex-intercom/releases/tag/v1.1.0
 [1.0.0]: https://github.com/MagicGeekSquad/codex-intercom/releases/tag/v1.0.0

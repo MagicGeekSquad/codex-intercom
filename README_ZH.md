@@ -88,7 +88,7 @@ sequenceDiagram
 |---|---|
 | 操作系统 | macOS 或 Linux（不支持 Windows） |
 | Python | 3.9+，只用标准库（macOS 自带的 `/usr/bin/python3` 即可） |
-| Codex | 支持 hooks 的 [Codex CLI](https://github.com/openai/codex)（在 `codex-cli` 0.167.2 和 0.169.0 上测试）；Codex App 可选 |
+| Codex | 支持 hooks 的 [Codex CLI](https://github.com/openai/codex)（在 `codex-cli` 0.167.2、0.169.0 和 0.170.0 上测试）；Codex App 可选 |
 | Claude Code | 较新的版本即可（用到 skills 和后台 Bash 任务） |
 
 ## 安装
@@ -163,10 +163,11 @@ Codex session 可以用链接（`codex://threads/<uuid>`，可从 Codex App 复�
 
 | 命令 | 作用 |
 |---|---|
-| `CI send --thread <id> --message "…"` | 发消息，并开始管理这个 session。选项：`--label 短名`、`--checkin 10m\|1h\|off`、`--queue`（不插话）、`--via auto\|app\|exec`、`--take-over`。省略 `--message` 时从 stdin 读取。 |
+| `CI new --label 短名 --message "…"` | 新建 Codex session，在后台 exec 运行第一轮并开始管理。选项：`--cwd 目录`、`--model 模型`、`--effort 强度`、`--search`、`--checkin`。省略 `--message` 时从 stdin 读取。用 exec 新建的 session 在 Codex App 里看不到。 |
+| `CI send --thread <id> --message "…"` | 发消息，并开始管理这个 session。选项：`--label 短名`、`--checkin 10m\|1h\|off`、`--queue`（不插话）、`--via auto\|app\|exec`、`--take-over`、`--model 模型` / `--effort 强度`（用于 exec 续跑）。省略 `--message` 时从 stdin 读取。 |
 | `CI listen` | 阻塞到任何一个被管理的 session 需要处理，输出一行 JSON 后退出。后台运行，每个管理者一个。选项：`--checkin 30m`、`--timeout N`。 |
 | `CI list` | 你管理的 session 及其状态（`working`、`waiting_start`、`stopped` + 原因）。`--all` 列出所有被管理的 session 和各自的管理者。 |
-| `CI status --thread <id>` | 单个 session 的细节：管理者、当前状态、进展快照、未报告的停下、未开始的消息、弹窗、exec 进程、队列。 |
+| `CI status --thread <id>` | 查看管理者、当前状态、进展快照、实际模型和用量，以及未报告的停下、未开始的消息、弹窗、exec 进程和队列。 |
 | `CI claim --thread <id>` / `CI release --thread <id>` | 不发消息也开始管理 / 交还（恢复 App 弹窗提问）。 |
 | `CI doctor [--thread <id>]` | 检查安装情况和最近的 hook 活动。 |
 | `CI install` / `CI uninstall [--remove-script]` | 注册 / 移除 Codex hooks（先备份 `hooks.json`）。 |
@@ -224,6 +225,8 @@ session 一直在工作时，`listen` 也会以 `reason: checkin` 结束，每�
 
 不需要。有 App 时，它打开着的 session 会在 App 里接收消息，你可以实时看到。没有 App（或 App 没打开这个 session）
 时，codex-intercom 用 `codex exec resume` 在 session 原来的工作目录里后台运行。两种情况都支持运行中插话。
+后台运行时沿用 session 原来的模型和推理强度：codex-intercom 会显式传入，因为单独运行 `codex exec resume`
+会改用 `config.toml` 的默认值（[openai/codex#32061](https://github.com/openai/codex/issues/32061)）。
 </details>
 
 <details>
@@ -268,7 +271,7 @@ skill 会让 Claude Code 关闭沙箱运行它们，所以你可能会看到权�
 <summary><b>Codex 升级后会不会失效？</b></summary>
 
 核心功能只依赖 Codex 公开的 hooks 和 CLI 命令。有两项是尽力而为的增强：判断 App 是否取走了排队的消息
-（只读 Codex 的队列数据库），以及进展快照（读 Codex 的会话记录）。这两种格式变化时，这两项会平稳降级，
+（只读 Codex 的队列数据库），以及进展快照和用量（读 Codex 的会话记录）。这两种格式变化时，这两项会平稳降级，
 停止检测照常工作。升级 Codex 后跑一次 `doctor`。
 </details>
 
@@ -303,7 +306,7 @@ install.sh / uninstall.sh                      安装与卸载脚本
 ```
 
 ```bash
-python3 tests/test_intercom.py          # 约 125 项检查，需要几分钟
+python3 tests/test_intercom.py          # 约 200 项检查，需要几分钟
 ```
 
 脚本开头的模块文档是设计参考：数据模型、如何推算“需要处理”，以及每种停止原因。

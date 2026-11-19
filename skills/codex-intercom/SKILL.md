@@ -1,11 +1,11 @@
 ---
 name: codex-intercom
-description: Claude Code 与 Codex session 之间的通信基础设施（对讲机），一个 Claude Code 会话可以同时管理任意多个 Codex session。向 Codex session（codex://threads/<id> 链接或 UUID）发消息：Codex 在工作时插进当前回合，停着时开新一轮；App 没打开这个 session 时自动改用 codex exec 在原目录运行。一个后台 listen 盯住你管理的所有 session，任何一个停下时通知一次，附带原因（完成、提问、等批准、模型或网络出错、中断、卡住、消息没开始）和最后回复；长任务还会定期唤醒你查看进展，取代手动设置的定时任务；等待期间 Claude Code 保持空闲。凡是要给 Codex 发消息、补充或纠正正在跑的 Codex 任务、等 Codex 做完或停下、定期查看 Codex 长任务进展、同时调度多个 Codex session、查 Codex session 状态，或拿到 codex://threads/ 链接时，都使用本 skill。
+description: Claude Code 与 Codex session 之间的通信基础设施（对讲机），一个 Claude Code 会话可以同时管理任意多个 Codex session。向 Codex session（codex://threads/<id> 链接或 UUID）发消息：Codex 在工作时插进当前回合，停着时开新一轮；App 没打开这个 session 时自动改用 codex exec 在原目录运行。一个后台 listen 盯住你管理的所有 session，任何一个停下时通知一次，附带原因（完成、提问、等批准、模型或网络出错、中断、卡住、消息没开始）和最后回复；长任务还会定期唤醒你查看进展，取代手动设置的定时任务；等待期间 Claude Code 保持空闲。凡是要新建 Codex session、给 Codex 发消息、补充或纠正正在跑的 Codex 任务、等 Codex 做完或停下、定期查看 Codex 长任务进展、同时调度多个 Codex session、查 Codex session 状态，或拿到 codex://threads/ 链接时，都使用本 skill。
 ---
 
 # codex-intercom：和 Codex session 对讲
 
-本 skill 只提供通信能力：发消息、听停下、查状态。发什么、停下后怎么处理，由当前任务决定。
+本 skill 只提供通信能力，包括新建 session、发消息、听停下和查状态。发什么、停下后怎么处理，由当前任务决定。
 
 下文 `CI` 指 `python3 <skill 目录>/scripts/codex_intercom.py`，`<skill 目录>` 是加载本 skill 时给出的 Base directory（用安装脚本装的是 `~/.claude/skills/codex-intercom`，作为插件装的在 `~/.claude/plugins/` 下）。所有命令都用 `dangerouslyDisableSandbox: true` 运行：脚本要写 `~/.codex/intercom`，`codex queue` 和 `codex exec` 要联网。
 
@@ -14,7 +14,7 @@ description: Claude Code 与 Codex session 之间的通信基础设施（对讲�
 ## 基本模型
 
 - **你是管理者。** 管理者就是当前这个 Claude Code 会话，脚本从 `$CLAUDE_CODE_SESSION_ID` 自动识别，不用传参。
-- **发过消息就归你管。** `send`（或 `claim`）之后，这个 Codex session 由你管理：`listen` 会盯着它；Codex 不能再用 App 弹窗提问（hook 会拒绝），而是把问题写在回复里并结束本轮，你会收到 `done`，问题在 `last_message` 里，用 `send` 回答。
+- **发过消息就归你管。** `new`、`send` 或 `claim` 之后，这个 Codex session 由你管理：`listen` 会盯着它；Codex 不能再用 App 弹窗提问（hook 会拒绝），而是把问题写在回复里并结束本轮，你会收到 `done`，问题在 `last_message` 里，用 `send` 回答。
 - **别人管着的不能碰。** 另一个 Claude Code 会话正在管理的 session，`send` / `claim` 会被拒绝（退出码 2，`error: owned_by_another_manager`，`owner` 是对方）。确实需要接管时加 `--take-over`，对方的 `listen` 会收到 `lost`。对方超过 24 小时没有活动、也没在 listen，就不再算数，可以直接接手。
 - **停下的消息不会丢。** 停下的记录在 Codex 侧的事件日志里，`listen` 每次运行时现场推算：你没在听时停下的，下次 `listen` 立刻报告。同一个 session 停了几次都没报告过时，只报最近一次，另带 `earlier_stops`（之前漏掉了几次）。
 
@@ -24,24 +24,38 @@ description: Claude Code 与 Codex session 之间的通信基础设施（对讲�
 CI send --thread <uuid 或 codex://threads/uuid> --message "消息内容" [--label 短名]
 ```
 
-- 长消息或多行消息：先用 Write 写进工作区文件，再执行 `CI send --thread <id> < msg.txt`（省略 `--message` 时从 stdin 读）。
+- 派发内容较长时，先写进工作区文件以便留档和复查，消息只发一行指针，例如“执行派发文件 <路径>（先完整读一遍再动手）”。省略 `--message` 时也可从 stdin 读消息，例如 `CI send --thread <id> < msg.txt`。
+- Codex 会把消息当作用户的话。以用户身份说话，避免提到 Claude Code 或监督。只有需要标注来源时才加 `--from NAME`。
+- 请 Codex 把详情写进交付文件，最后回复用两三句概括。`last_message` 会进入管理者的上下文，短回复可以节省 token。
 - `--label`：给这个 session 起个短名（如 `auth-refactor`），之后 `listen` 和 `list` 的输出里都会带上。同时管理多个 session 时建议加。
 - `--checkin 10m`：这个 session 一直在工作时，每隔多久唤醒你看一次进展（`90s`、`10m`、`1h`；`off` 关闭）。不加就用 `listen` 的默认值（30 分钟）。按任务的预计时长和需要盯得多紧来定。
-- Codex 会把消息当作用户的话。只有需要标注来源时才加 `--from NAME`。
 - `--queue`：不插话，总是开新一轮。`--via app|exec`：指定开新一轮的通道，默认 `auto`。
+- `--model` 和 `--effort` 只在走 exec 时生效，显式指定的值会保存为该 session 以后走 exec 的默认值。省略时，脚本会逐项沿用已保存的值或 rollout 中最近的非空值并显式传给 `codex exec resume`，因为该命令自行续跑时会改用 Codex 配置。
 
 输出是一行 JSON：
 
 | 字段 | 含义 |
 |---|---|
 | `mode: steer` | Codex 正在工作，消息会在它下一次工具调用后注入；如果回合正要结束，就作为续写提示 |
-| `mode: queue`，`transport: app` | Codex 停着，App 已取走消息，开始新一轮 |
+| `mode: queue`，`transport: app` | 消息已交给 App 通道，可能还在排队；用 `listen` 或 `status` 看这一轮的状态 |
 | `transport: exec` | App 没打开这个 session，已用 `codex exec resume` 在 session 原目录后台运行（输出在 `exec_log`） |
 | `transport: queued` | 没有人在处理，消息留在 Codex 队列里，App 打开这个 session 时才会处理 |
 | `transport: blocked` | App 里有接管之前就弹出的提问弹窗还没处理（`blocked_by_question`）。消息已经排队，要等用户在 App 里回答、跳过或取消弹窗后才会开始 |
+| `exec_settings` / `ignored_exec_options` | exec 续跑时，`exec_settings` 逐项记录 `model` 和 `effort` 的传参值 `value` 和来源 `source`，来源为 `explicit`（本次参数）、`session`（保存值）、`rollout`（历史记录）或 `config`（沿用 Codex 配置，`value` 为 `null`）。本轮没有走 exec 时，`ignored_exec_options` 列出本次传了但未生效的选项 |
 | `claimed` / `taken_over_from` / `previous_owner` | 这次发送让你开始管理它 / 从谁手里接管 / 接手了谁已失效的管理 |
 | `listening` | 你是否已有 `listen` 在后台运行。为 `false` 时启动一个（见下节）；为 `true` 时什么都不用做，新 session 会自动被它盯上 |
 | `ok: false` | 发送失败，原因见 `codex_queue` 或 `error` |
+
+## 新建 Codex session（前台运行）
+
+```bash
+CI new --label 短名 --message "第一轮消息" [--cwd 目录] [--model 模型] [--effort 强度] [--search] [--checkin 10m]
+```
+
+- 把任务直接放进第一轮即可，无需先跑一轮确认环境。省略 `--message` 时从 stdin 读，`--checkin` 与 `send` 相同。
+- 目录默认是当前目录，模型和推理强度默认由 Codex 配置决定。`--search` 启用实时网页搜索。
+- `new` 启动后台 exec，拿到 thread ID 后开始管理。输出一行 JSON，包含 `ok`、`thread`、`label`、`claimed`、`listening`、`exec_log`、`exec_pid` 和 `cwd`。60 秒内拿不到 thread ID，或 exec 提前退出时，查看 `error` 和 `log_tail`。
+- exec 新建的 session 在 Codex App 里看不到。建议加 `--label`，向用户提到这个 session 时附上 label 和 thread ID。`listening: false` 时启动一个 `listen`。
 
 ## 听 Codex 停下（后台运行）
 
@@ -50,12 +64,12 @@ CI listen
 ```
 
 - 用 `run_in_background: true` 运行，然后结束本轮。等待期间会话是空闲的，可以正常对话、做别的事。任何一个你管理的 session 需要处理时，后台任务结束，你收到一次通知，读它的输出（一行 JSON）。
-- 一个管理者只需要一个 `listen`，它覆盖你管理的全部 session，包括它运行期间新 `send` 的。重复启动会立即返回 `already_listening`，忽略即可。
+- 一个管理者只需要一个 `listen`，它覆盖你管理的全部 session，包括它运行期间通过 `new` 或 `send` 开始管理的。重复启动会立即返回 `already_listening`，忽略即可。
 - 几个 session 差不多同时停下（2 秒内）时，会合并成一次通知。
 - **定期查看进展（取代定时任务）**：session 一直在工作时，`listen` 每隔一段时间（默认 30 分钟，见 `send --checkin`）也会结束一次，`reason: checkin`，`progress` 里是进展快照。不需要再给 Claude Code 设定时任务。被唤醒时，所有已过半个间隔的工作中 session 会一起带上，免得被逐个叫醒。`listen --checkin 20m` 改默认间隔，`off` 关闭。
-- 处理完通知后：`watching` 或 `progress` 不为空（还有 session 在跑），或者你刚发了新消息，就再启动一次 `listen`。
+- `watching` 或 `progress` 不为空、你刚发了新消息，或收到 `not_started` 后还要查看此前暂缓报告的结果时，再启动一次 `listen`。
 - 用户在 App 里自己对被管理的 session 发起的回合，停下时也会报告。
-- 不要用 Monitor 或定时轮询来盯 Codex。
+- 等待 Codex 时不用 cron、Monitor 或 ScheduleWakeup，也不自写脚本读日志。
 
 输出：
 
@@ -76,7 +90,7 @@ CI listen
 | `approval` | Codex 在等批准（`tool`、`detail`），已经等了 30 秒以上，只能在 App 里处理 |
 | `error` | 模型请求失败后停下（`error`：容量不足、限流、网络等；`failures` 是连续失败次数）。网络错误时 Codex 还会自己重连；同一段连续失败只报一次 |
 | `interrupted` | 本轮被中断（用户在 App 里点了停止） |
-| `ended` | exec 通道的 `codex exec` 进程退出了，但本轮没有正常结束（`exec_log`） |
+| `ended` | `codex exec` 进程退出时，hooks 还没有记录到本轮结束（`exec_log`）。稍后收到真实 `Stop` 时，还会报告它的 `last_message` |
 | `stalled` | 太久没有任何事件（工具运行中 30 分钟、模型请求中 15 分钟、其他情况 5 分钟），可能是 App 崩溃、卡住，或者关掉了这个 session |
 | `not_started` | 发出的消息 5 分钟内没有开始处理（`queued` 是这些消息，`codex_queue` 是 Codex 队列里的条数，`session_state` 是 session 卡在哪，`blocked_by_question` 是挡路的弹窗），或者 exec 进程没开始就退出了（`exec_exit`） |
 
@@ -84,7 +98,7 @@ CI listen
 
 - `earlier_stops`：这次报告之前还停过几次、都没报告过（只报最近一次）。
 - `undelivered`：插话还没送达就停了。这些消息会随下一条发给 Codex 的消息自动带上，不要重发，否则 Codex 会收到两遍。
-- 消息发出后、它的回合开始之前，`listen` 不会把这个 session 之前的停下当作结果报告；要么等到这条消息自己那一轮停下，要么超时报 `not_started`。
+- 后续消息还在排队时，`listen` 可以先报告已确认开工的上一条消息的结果，后续消息继续出现在 `watching` 里。其他回合的停下会暂缓，等到已发消息自己的结果可以一起报告，或在开工超时之后的下一次 `listen` 报告。
 
 `progress` 里每项（进展快照）：
 
@@ -94,8 +108,9 @@ CI listen
 | `in_flight`、`silence_s`、`last_event` | 现在在做什么（`model` / `tool` / `between steps`）、多久没有新事件、最后一个事件 |
 | `tool_calls`、`model_requests`、`failed_requests` | 本轮的工具调用次数、模型请求次数、失败的模型请求次数 |
 | `activity` | 从 Codex 自己的会话记录读出的本轮动态：`messages` 是 Codex 最近几条进度说明，`recent_commands` / `commands_run` 是最近执行的命令和总数，`files_changed` 是改过的文件，`compactions` 是上下文压缩次数，`partial: true` 表示本轮太长只读了后半段。会话记录格式不归本 skill 控制，读不到时没有这一项 |
+| `usage` | `stops` 的各项和 `status` 顶层也会包含此字段。它从 Codex 的会话记录读取 `model`、`effort`、本轮用量 `turn` 和会话累计用量 `session`。用量字段为 `input`、`cached_input`、`output`、`reasoning` 和 `total`。缺失的部分省略，全部缺失时省略 `usage` |
 
-看完进展：方向对，直接再启动 `listen`；跑偏了，用 `send` 插话纠正（会在 Codex 下一次工具调用后注入）；需要细节，用 `status` 或读 Codex 的会话记录。
+看完进展，方向对就直接再启动 `listen`，不必向用户汇报“无变化”。跑偏了就用 `send` 插话纠正，消息会在 Codex 下一次工具调用后注入。需要细节时用 `status`。
 
 ## 管理与交还
 
@@ -106,7 +121,7 @@ CI listen
 ## 查状态
 
 - `CI list`：你管理的所有 session，每项有 `state`（`working` / `waiting_start` / `stopped` + `reason` / `unknown`）、`unreported`（下次 `listen` 会不会报它）、`last_message`。`--all` 列出所有被管理的 session 和各自的管理者。
-- `CI status --thread <id>`：单个 session 的细节：管理者（`owner`）、当前判断（`codex`）、工作中时的进展快照（`progress`）、待报告的停下（`unreported`）、还没开始的消息（`pending_sends`）、查看间隔（`checkin_s`、`last_checkin`）、未处理的提问弹窗、exec 进程、Codex 队列条数、未送达和最近送达的插话。
+- `CI status --thread <id>`：单个 session 的细节：管理者（`owner`）、当前判断（`codex`）、工作中时的进展快照（`progress`）、实际模型和用量（`usage`）、待报告的停下（`unreported`）、还在等开工通知的消息（`pending_sends`）、查看间隔（`checkin_s`、`last_checkin`）、未处理的提问弹窗、最近一次 exec 及其存活状态、Codex 队列条数、未送达和最近送达的插话。
 
 ## 安装与排障
 

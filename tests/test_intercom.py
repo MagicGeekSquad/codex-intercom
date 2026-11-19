@@ -6,7 +6,9 @@ the exec transport (fake codex + fake queue store), popups/gate and install/unin
 usage: python3 tests/test_intercom.py [path/to/codex_intercom.py]
        (default: skills/codex-intercom/scripts/codex_intercom.py in this repo)
 """
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import sqlite3
@@ -16,6 +18,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MB = (os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else
@@ -26,13 +29,18 @@ spec.loader.exec_module(cm)
 
 FAKE = os.path.join(HERE, "fake_codex.py")
 TMP = tempfile.mkdtemp(prefix="intercom-test-", dir=os.environ.get("TMPDIR"))
+FAKE_BIN = os.path.join(TMP, "bin")
+os.mkdir(FAKE_BIN)
+os.symlink(FAKE, os.path.join(FAKE_BIN, "codex"))  # doctor must never probe the installed Codex
 BOX = os.path.join(TMP, "data")
 WORKDIR = os.path.realpath(os.path.join(TMP, "work"))
 os.makedirs(WORKDIR)
 SESS = os.path.join(TMP, "sessions")
 os.environ.update({"FAKE_DIR": TMP, "CODEX_QUEUE_DB": os.path.join(TMP, "queue.sqlite"), "FAKE_MB": MB,
-                   "FAKE_BOX": BOX, "CODEX_SESSIONS_DIR": SESS})
+                   "FAKE_BOX": BOX, "CODEX_SESSIONS_DIR": SESS,
+                   "PATH": FAKE_BIN + os.pathsep + os.environ.get("PATH", "")})
 os.environ.pop("CODEX_INTERCOM_MANAGER", None)
+os.environ.pop("CODEX_INTERCOM_DIR", None)
 FAILS = []
 FAST = ("--settle", "0.6", "--poll", "0.2", "--timeout", "25")  # safety net: a test may not hang
 
@@ -67,13 +75,21 @@ def hook(sid, event, turn="t1", **extra):
     return json.loads(p.stdout) if p.stdout.strip() else None
 
 
-def cli(mgr, *a):
-    p = subprocess.run([sys.executable, MB, "--dir", BOX, "--manager", mgr] + list(a), capture_output=True, text=True)
+def cli(mgr, *a, stdin=None, data_dir=BOX):
+    p = subprocess.run([sys.executable, MB, "--dir", data_dir, "--manager", mgr] + list(a),
+                       input=stdin, capture_output=True, text=True)
     assert p.stdout.strip(), "no output: rc=%s %s" % (p.returncode, p.stderr)
     out = json.loads(p.stdout)
     if isinstance(out, dict):
         out["_rc"] = p.returncode
     return out
+
+
+def local_cli(mgr, *args):
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        rc = cm.main(["--dir", BOX, "--manager", mgr, *args])
+    return dict(json.loads(output.getvalue()), _rc=rc)
 
 
 def send(mgr, sid, text, *extra):
@@ -141,6 +157,11 @@ def record(sid):
     return json.load(open(os.path.join(BOX, sid, "session.json")))
 
 
+def last_resume_args():
+    with open(os.path.join(TMP, "exec_calls.jsonl")) as f:
+        return json.loads(f.readlines()[-1])["args"]
+
+
 def age_manager(mid):
     p = os.path.join(BOX, "_managers", mid + ".json")
     d = json.load(open(p))
@@ -158,15 +179,31 @@ def by_thread(out, key="stops"):
     return {s["thread"]: s for s in out.get(key, [])}
 
 
-def fake_rollout(sid, turn, items):
-    """Append one turn to a Codex-style rollout file (only the parts the progress snapshot reads)."""
+def append_rollout(sid, *rows):
     d = os.path.join(SESS, "2026", "11", "13")
     os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, "rollout-2026-11-13T00-00-00-%s.jsonl" % sid), "a", encoding="utf-8") as f:
-        f.write(json.dumps({"type": "event_msg", "payload": {"type": "task_started", "turn_id": turn}}) + "\n")
-        for it in items:
-            f.write(json.dumps({"type": "event_msg", "payload": {"type": "item_completed", "thread_id": sid,
-                                                                 "turn_id": turn, "item": it}}, ensure_ascii=False) + "\n")
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def rollout_event(kind, **payload):
+    return {"type": "event_msg", "payload": dict(payload, type=kind)}
+
+
+def fake_rollout(sid, turn, items, model=None, effort=None):
+    """Append the start and visible activity of a Codex-style rollout turn."""
+    append_rollout(sid, rollout_event("task_started", turn_id=turn))
+    if model or effort:
+        append_rollout(sid, {"type": "turn_context", "payload": {"turn_id": turn, "model": model, "effort": effort}})
+    append_rollout(sid, *(rollout_event("item_completed", thread_id=sid, turn_id=turn, item=it) for it in items))
+
+
+def token_count(unit):
+    fields = {"input_tokens": 10, "cached_input_tokens": 5, "output_tokens": 3,
+              "reasoning_output_tokens": 2, "total_tokens": 13}
+    return rollout_event("token_count", info={"total_token_usage": {k: v * unit for k, v in fields.items()},
+                                              "last_token_usage": fields}, rate_limits=None)
 
 
 def say(text):
@@ -254,7 +291,7 @@ ABOX = cm.Session(os.path.join(TMP, "abox"), sid_n(99))
 
 def att(events, rec, now, queue=None, **cfg):
     c = dict(cm.DEFAULT_CFG, **cfg)
-    return cm.assess(ABOX, dict({"expect": []}, **rec), sorted(events, key=lambda e: e["t"]), now, c, queue)
+    return cm.assess(ABOX, dict({"expect": []}, **rec), lambda: sorted(events, key=lambda e: e["t"]), now, c, queue)
 
 
 turns3 = [E(10, "UserPromptSubmit", turn="a"), E(11, "Stop", turn="a", msg="one"),
@@ -280,38 +317,90 @@ check(r["attention"]["last_message"] == "ours" and r["attention"]["earlier_stops
       "A2 ours taken + started -> its stop, earlier ones counted")
 r = att(ours, {"reported": 21, "expect": [dict(x, queuing=True)]}, 40, queue={})
 check(r["attention"] is None, "A2 send still being queued counts as not started")
+fresh = {"id": "m2", "t": 330, "qid": "q2"}
+r = att(turns3, {"reported": 21, "expect": [x, fresh]}, 336, queue=dict.fromkeys(("q1", "q2"), sid_n(99)))
+check([q["id"] for q in r["attention"]["queued"]] == ["m1"], "A2 each pending send has its own start deadline")
 dead = subprocess.Popen(["true"])
 dead.wait()
 ex = {"pid": dead.pid, "started": 10, "log": os.path.join(TMP, "no-such.log")}
 mid = [E(9.6, "UserPromptSubmit", turn="setup"), E(9.7, "Stop", turn="setup"),  # a turn just before the spawn
        E(11, "UserPromptSubmit", turn="x"), E(12, "PreModelRequest", turn="x")]
-end = cm.exec_end(mid, ex)
-check(end and end["t"] == 12.001 and not end.get("before_start"), "A2 exec gone mid-turn -> synthetic end after its last event")
-check(cm.exec_end(mid + [E(13, "Stop", turn="x"), E(20, "UserPromptSubmit", turn="y")], ex) is None,
+end = cm.current({"exec": ex}, lambda: mid, 13, cm.DEFAULT_CFG)["exec_end"]
+check(end and end["t"] == 12.001 and end["reason"] == "ended", "A2 exec gone mid-turn -> synthetic end after its last event")
+later = mid + [E(13, "Stop", turn="x"), E(20, "UserPromptSubmit", turn="y")]
+check(cm.current({"exec": ex}, lambda: later, 21, cm.DEFAULT_CFG)["exec_end"] is None,
       "A2 exec run over and a later turn started -> no synthetic end")
-check(cm.exec_end([E(5, "Stop")], ex).get("before_start"), "A2 exec gone without a turn -> before_start")
-check(cm.exec_end(mid, dict(ex, pid=os.getpid())) is None, "A2 exec still running -> nothing")
+end = cm.current({"exec": ex}, lambda: [E(5, "Stop")], 13, cm.DEFAULT_CFG)["exec_end"]
+check(end["reason"] == "not_started" and end["exec_exit"], "A2 exec gone without a turn -> before_start")
+quiet_run = dict(ex, reported_end=end)
+app_turn = [E(5, "Stop"), E(20, "UserPromptSubmit", turn="app")]
+check(cm.current({"exec": quiet_run}, lambda: app_turn, 21, cm.DEFAULT_CFG)["info"]["reason"] == "working",
+      "A2 a reported before-start exit does not stop the next App turn")
+check(cm.current({"exec": dict(ex, pid=os.getpid())}, lambda: mid, 13, cm.DEFAULT_CFG)["exec_end"] is None,
+      "A2 exec still running -> nothing")
 
 # ================================================================== A3. progress snapshot from the rollout
 RS = sid_n(98)
+rs_box = cm.Session(BOX, RS)
 fake_rollout(RS, "old-turn", [say("上一轮的话"), ran("make old")])
 fake_rollout(RS, "cur-turn", [say("先读代码"), ran("rg foo"), ran("pytest -q", 1),
                               {"type": "FileChange", "changes": {os.path.join(cm.HOME, "p", "a.py"): {"type": "update"}}},
                               say("测试失败 1 个，正在修"), {"type": "ContextCompaction"}])
 with open(cm.rollout_paths(RS)[-1], "a") as f:
     f.write('{"type":"event_msg","payload":{"type":"item_completed","turn_id":"cur-turn","item":{"type":"Agent\n')
-p = cm.rollout_progress(RS, "cur-turn")
+p = cm.rollout_snapshot(rs_box, "cur-turn", include_activity=True).get("activity")
 check(p and p["messages"] == ["先读代码", "测试失败 1 个，正在修"] and p["commands_run"] == 2
       and p["recent_commands"][-1] == {"cmd": "pytest -q", "status": "completed", "exit_code": 1}
       and p["files_changed"] == ["~/p/a.py"] and p["compactions"] == 1 and "partial" not in p,
       "A3 rollout: this turn's commentary, commands, files (other turns and broken lines skipped)")
-check(cm.rollout_progress(RS, "no-such-turn") is None and cm.rollout_progress(sid_n(97), "cur-turn") is None,
-      "A3 rollout: nothing known -> None")
-snap = cm.progress_snapshot(RS, [E(1, "UserPromptSubmit", turn="cur-turn"), E(2, "PostToolUse", turn="cur-turn"),
-                                 E(3, "PostModelRequest", turn="cur-turn", status="failed")],
+check(cm.rollout_snapshot(rs_box, "no-such-turn", include_activity=True) == {}
+      and cm.rollout_snapshot(cm.Session(BOX, sid_n(97)), "cur-turn", include_activity=True) == {},
+      "A3 rollout: nothing known -> no activity or usage")
+snap = cm.progress_snapshot(rs_box, [E(1, "UserPromptSubmit", turn="cur-turn"), E(2, "PostToolUse", turn="cur-turn"),
+                                     E(3, "PostModelRequest", turn="cur-turn", status="failed")],
                             {"in_flight": "tool", "silence_s": 5}, 61)
 check(snap["running_s"] == 60 and snap["tool_calls"] == 1 and snap["failed_requests"] == 1
       and snap["activity"]["commands_run"] == 2, "A3 snapshot: hook counts + rollout activity")
+
+RU = sid_n(96)
+ru_box = cm.Session(BOX, RU)
+fake_rollout(RU, "spent-1", [], "model-one", "high")
+append_rollout(RU, token_count(1), token_count(2), rollout_event("task_complete", turn_id="spent-1"))
+fake_rollout(RU, "spent-2", [], "model-two", "medium")
+append_rollout(RU, token_count(3), rollout_event("token_count", info=None), token_count(5))
+spent_1 = cm.rollout_snapshot(ru_box, "spent-1")["usage"]
+spent_2 = cm.rollout_snapshot(ru_box)["usage"]
+check(spent_1 == {"model": "model-one", "effort": "high",
+                  "turn": {"input": 20, "cached_input": 10, "output": 6, "reasoning": 4, "total": 26},
+                  "session": {"input": 20, "cached_input": 10, "output": 6, "reasoning": 4, "total": 26}},
+      "A3 usage: first turn's totals exclude the next turn")
+check(spent_2 == {"model": "model-two", "effort": "medium",
+                  "turn": {"input": 30, "cached_input": 15, "output": 9, "reasoning": 6, "total": 39},
+                  "session": {"input": 50, "cached_input": 25, "output": 15, "reasoning": 10, "total": 65}},
+      "A3 usage: turn delta differs from latest model request and session total")
+append_rollout(RU, rollout_event("turn_aborted", turn_id="spent-2"))
+fake_rollout(RU, "no-sample", [], "model-three")
+append_rollout(RU, rollout_event("token_count", info=None))
+check(cm.rollout_snapshot(ru_box)["usage"] == {"model": "model-three", "session": spent_2["session"]},
+      "A3 usage: omit missing effort and turn counters")
+
+RT = sid_n(95)
+rt_box = cm.Session(BOX, RT)
+append_rollout(RT, token_count(5), {"type": "response_item", "payload": "x" * cm.ROLLOUT_TAIL})
+fake_rollout(RT, "tail-turn", [], "tail-model", "low")
+append_rollout(RT, token_count(6))
+with patch.object(cm, "ROLLOUT_USAGE_LIMIT", cm.ROLLOUT_TAIL + 1):
+    check(cm.rollout_snapshot(rt_box, "tail-turn")["usage"] == {
+        "model": "tail-model", "effort": "low",
+        "session": {"input": 60, "cached_input": 30, "output": 18, "reasoning": 12, "total": 78}},
+        "A3 usage: a missing baseline in a truncated rollout omits turn totals")
+append_rollout(RT, {"type": "response_item", "payload": "x" * cm.ROLLOUT_TAIL},
+               token_count(7), rollout_event("task_complete", turn_id="tail-turn"))
+with patch.object(cm, "ROLLOUT_USAGE_LIMIT", cm.ROLLOUT_TAIL + 1):
+    cold_box = cm.Session(os.path.join(TMP, "cold-data"), RT)
+    check(cm.rollout_snapshot(cold_box, "tail-turn") == {
+        "usage": {"session": {"input": 70, "cached_input": 35, "output": 21, "reasoning": 14, "total": 91}}},
+        "A3 usage: a terminal boundary can attribute a truncated turn's final session total")
 
 # ================================================================== B. hooks + steering
 MBM = "mgr-b"
@@ -319,12 +408,19 @@ S = sid_n(1)
 r = send(MBM, S, "hello idle", "--via", "app")
 check(r["mode"] == "queue" and r["transport"] == "app" and "Queued message" in r["codex_queue"] and r.get("claimed")
       and r["listening"] is False and r.get("next"), "B unknown/idle session -> codex queue, claimed, no listener yet")
+with open(os.path.join(HERE, "..", "skills", "codex-intercom", "SKILL.md"), encoding="utf-8") as f:
+    app_row = next(line for line in f if "`mode: queue`，`transport: app`" in line)
+check(r["mode"] == "queue" and r["transport"] == "app" and queued(S) == 1
+      and "消息已交给 App 通道，可能还在排队；用 `listen` 或 `status` 看这一轮的状态" in app_row,
+      "B review 10: SKILL describes App handoff before a queued turn starts")
 check(record(S)["manager"] == MBM and record(S)["expect"][0]["qid"], "B the send is recorded as not started (with its queue id)")
 app_take(S)
 check(hook(S, "UserPromptSubmit", prompt="hello idle") is None and state(S)["status"] == "working",
       "B UserPromptSubmit marks working")
-r = send(MBM, S, "请改用方案 B", "--from", "Claude Code")
+r = send(MBM, S, "请改用方案 B", "--from", "Claude Code", "--effort", "high")
 check(r["mode"] == "steer" and len(inbox(S)) == 1, "B working -> steer into inbox")
+check(r.get("ignored_exec_options") == ["--effort"] and "exec_settings" not in r,
+      "B steer reports that the requested effort did not affect the current turn")
 out = hook(S, "PostToolUse", tool_name="Bash", tool_use_id="x1")
 ctx = out and out["hookSpecificOutput"]["additionalContext"]
 check(bool(ctx) and "请改用方案 B" in ctx and "Claude Code" in ctx and inbox(S) == [], "B PostToolUse injects it")
@@ -430,6 +526,7 @@ hook(S3, "Stop", last_assistant_message="three done")
 cli(ML, "release", "--thread", S1)
 r = listen(ML)
 check(set(by_thread(r)) == {S3} and "lost" not in r, "D own release is not reported as lost")
+check("usage" not in by_thread(r)[S3], "D listen stop omits usage without a rollout")
 
 S5 = sid_n(15)
 cli(ML, "claim", "--thread", S5)
@@ -456,12 +553,18 @@ r = listen(ML)
 check(by_thread(r).get(S6, {}).get("last_message") == "ours done", "D ... reported once ours ran")
 S7 = sid_n(17)
 cli(ML, "claim", "--thread", S7)
-turn(S7, "w0", "idle")
+turn(S7, "w0", "previous turn done")
+before_timeout = record(S7)["reported"]
 send(ML, S7, "nobody takes this", "--via", "app")
 r = listen(ML, "--start-timeout", "1.5")
 st = by_thread(r).get(S7, {})
 check(st.get("reason") == "not_started" and st["queued"][0]["preview"] == "nobody takes this" and st["codex_queue"] == 1,
       "D a send that never starts -> not_started with the queued message")
+after_timeout = record(S7)["reported"]
+r = listen(ML, "--start-timeout", "1.5", "--timeout", "1.5")
+check(after_timeout == before_timeout and by_thread(r).get(S7, {}).get("last_message") == "previous turn done",
+      "D review 2: start timeout leaves the held-back Stop reportable (cursor advanced: %s, next: %s)"
+      % (after_timeout > before_timeout, r["reason"]))
 r = listen(ML, "--start-timeout", "1.5", "--timeout", "1.5")
 check(r["reason"] == "timeout", "D not_started is reported once")
 S8 = sid_n(18)
@@ -484,7 +587,8 @@ check(S1 not in rows and rows[S3]["state"] == "stopped" and rows[S3]["unreported
 # ================================================================== D2. progress check-ins
 MC = "mgr-ck"
 SA, SB, SC = sid_n(50), sid_n(51), sid_n(52)
-fake_rollout(SA, "ck1", [say("正在跑第 3/10 组测试"), ran("pytest -k group3")])
+fake_rollout(SA, "ck1", [say("正在跑第 3/10 组测试"), ran("pytest -k group3")], "progress-model", "high")
+append_rollout(SA, token_count(1))
 cli(MC, "claim", "--thread", SA, "--label", "long", "--checkin", "3")
 cli(MC, "claim", "--thread", SB)  # no interval of its own: listen's --checkin applies
 hook(SA, "UserPromptSubmit", turn="ck1", prompt="long task")
@@ -495,16 +599,27 @@ pg = by_thread(r, "progress")
 check(r["reason"] == "checkin" and set(pg) == {SA} and time.time() - t0 >= 2.5
       and pg[SA]["activity"]["messages"] == ["正在跑第 3/10 组测试"] and pg[SA]["running_s"] >= 2
       and pg[SA]["label"] == "long", "D2 still working after its interval -> checkin with a progress snapshot")
+check(pg[SA]["usage"]["model"] == "progress-model" and pg[SA]["usage"]["turn"]["total"] == 13
+      and cli(MC, "status", "--thread", SA)["usage"] == pg[SA]["usage"],
+      "D2 check-in and status report the working turn's usage")
 check([w["thread"] for w in r["watching"]] == [SB], "D2 ... a session far from its own check-in stays under watching")
 r = listen(MC, "--checkin", "5")  # SB due ~1.5s from now; SA by then past half of its 3s
 pg = by_thread(r, "progress")
 check(r["reason"] == "checkin" and set(pg) == {SA, SB}, "D2 one check-in due -> those halfway there come along")
+check("usage" not in pg[SB], "D2 a progress entry without a rollout omits usage")
 r = listen(MC, "--checkin", "4", "--timeout", "1.2")
 check(r["reason"] == "timeout", "D2 the next check-in waits for the interval again")
 time.sleep(1.5)
+append_rollout(SA, token_count(2), rollout_event("task_complete", turn_id="ck1"))
+fake_rollout(SA, "future-turn", [], "future-model", "low")
+append_rollout(SA, token_count(3))
 hook(SA, "Stop", turn="ck1", last_assistant_message="long done")
 r = listen(MC, "--checkin", "4")
 check(set(by_thread(r)) == {SA} and set(by_thread(r, "progress")) == {SB}, "D2 a stop brings along a check-in halfway due")
+stop_usage = by_thread(r)[SA]["usage"]
+check(stop_usage["model"] == "progress-model" and stop_usage["turn"]["total"] == 26
+      and cli(MC, "status", "--thread", SA)["usage"] == stop_usage,
+      "D2 stop and status do not use token counts from a later rollout turn")
 cli(MC, "release", "--thread", SB)
 cli(MC, "claim", "--thread", SC, "--checkin", "off")
 hook(SC, "UserPromptSubmit", turn="c1", prompt="no check-ins please")
@@ -512,15 +627,96 @@ r = listen(MC, "--checkin", "1", "--timeout", "2.5")
 check(r["reason"] == "timeout" and r["watching"][0]["thread"] == SC, "D2 --checkin off: no check-ins for that session")
 st = cli(MC, "status", "--thread", SC)
 check(st["progress"] and st["progress"]["turn_id"] == "c1" and st["checkin_s"] == 0, "D2 status shows progress while working")
+check("usage" not in st, "D2 no rollout -> no usage in status")
+
+# ================================================================== D3. long turns and the per-session usage cache
+MU, SL = "mgr-long-usage", sid_n(53)
+long_turn = "long-usage"
+fake_rollout(SL, "preceding", [], "preceding-model", "low")
+append_rollout(SL, token_count(2), rollout_event("task_complete", turn_id="preceding"))
+fake_rollout(SL, long_turn, [say("older commentary")], "long-model", "high")
+append_rollout(SL, token_count(3), {"type": "response_item", "payload": "x" * (cm.ROLLOUT_TAIL + 100)},
+               token_count(4), rollout_event("item_completed", turn_id=long_turn, item=say("recent commentary")))
+cli(MU, "claim", "--thread", SL, "--checkin", "1")
+long_box = cm.Session(BOX, SL)
+long_box.log_event(E(time.time() - 5, "UserPromptSubmit", turn=long_turn))
+with patch.object(cm, "rollout_rows", wraps=cm.rollout_rows) as read_blocks:
+    st = local_cli(MU, "status", "--thread", SL)
+    check(st["codex"]["reason"] == "working" and st.get("usage", {}).get("model") == "long-model"
+          and st["usage"]["effort"] == "high" and st["usage"]["turn"]["total"] == 26
+          and st["usage"]["session"]["total"] == 52 and read_blocks.call_count > 1,
+          "D3 status recovers the model, effort and baseline of a still-running long turn")
+with open(long_box.usage_path) as f:
+    saved_usage = json.load(f)[long_turn]
+with open(cm.rollout_paths(SL)[-1], "rb") as f:
+    f.seek(saved_usage["start"])
+    start_marker = json.loads(f.readline())["payload"]
+check(start_marker == {"type": "task_started", "turn_id": long_turn} and saved_usage["baseline"]["total"] == 26,
+      "D3 usage cache persists the exact turn start offset and pre-turn total")
+append_rollout(SL, token_count(5))
+with patch.object(cm, "rollout_rows", wraps=cm.rollout_rows) as read_blocks:
+    r = local_cli(MU, "listen", "--settle", "0", "--timeout", "1")
+    entry = by_thread(r, "progress").get(SL, {})
+    check(r["reason"] == "checkin" and entry.get("usage", {}).get("model") == "long-model"
+          and entry["usage"]["effort"] == "high" and entry["usage"]["turn"]["total"] == 39
+          and entry["usage"]["session"]["total"] == 65 and read_blocks.call_count == 1,
+          "D3 listen check-in reuses the cached turn metadata and reads just the tail for updated usage")
+check(entry.get("activity", {}).get("messages") == ["recent commentary"] and entry["activity"]["partial"],
+      "D3 activity still summarizes only the tail of a long turn")
+filler = {"type": "response_item", "payload": "x" * cm.ROLLOUT_TAIL}
+large_append = [filler] * (cm.ROLLOUT_USAGE_LIMIT // cm.ROLLOUT_TAIL + 1)
+append_rollout(SL, *large_append, token_count(6), rollout_event("task_complete", turn_id=long_turn))
+fake_rollout(SL, "next", [], "next-model", "low")
+append_rollout(SL, token_count(7))
+hook(SL, "Stop", turn=long_turn, last_assistant_message="long turn done")
+r = listen(MU, "--settle", "0")
+st = by_thread(r).get(SL, {})
+long_usage = st.get("usage", {})
+check(st.get("reason") == "done" and long_usage.get("model") == "long-model"
+      and long_usage.get("effort") == "high" and long_usage.get("turn", {}).get("total") == 52
+      and long_usage.get("session", {}).get("total") == 78
+      and cli(MU, "status", "--thread", SL).get("usage") == long_usage,
+      "D3 review 6: listen and status retain the cached turn after a >64 MiB append (usage keys: %s)"
+      % sorted(long_usage))
+
+SU = sid_n(54)
+fake_rollout(SU, "outside-limit", [], "unreachable-model", "high")
+append_rollout(SU, token_count(1), filler, filler, token_count(2))
+cli(MU, "claim", "--thread", SU)
+hook(SU, "UserPromptSubmit", turn="outside-limit", prompt="long task")
+with patch.object(cm, "ROLLOUT_USAGE_LIMIT", cm.ROLLOUT_TAIL * 2):
+    with patch.object(cm, "rollout_rows", wraps=cm.rollout_rows) as read_blocks:
+        st = local_cli(MU, "status", "--thread", SU)
+        check(st["_rc"] == 0 and st["codex"]["reason"] == "working" and "usage" not in st
+              and read_blocks.call_count == 2,
+              "D3 usage omits fields whose evidence lies beyond the read limit")
+
+SU = sid_n(59)
+partial_box = cm.Session(BOX, SU)
+append_rollout(SU, rollout_event("task_started", turn_id="context-only"), filler, filler,
+               {"type": "turn_context", "payload": {"turn_id": "context-only", "model": "partial", "effort": "high"}})
+with patch.object(cm, "ROLLOUT_USAGE_LIMIT", cm.ROLLOUT_TAIL + 1):
+    partial_usage = cm.rollout_snapshot(partial_box, "context-only").get("usage")
+    append_rollout(SU, filler, filler, token_count(2), rollout_event("task_complete", turn_id="context-only"))
+    partial_done = cm.rollout_snapshot(partial_box, "context-only").get("usage", {})
+check(partial_usage == {"model": "partial", "effort": "high"} and partial_done.get("model") == "partial"
+      and partial_done.get("effort") == "high" and partial_done.get("session", {}).get("total") == 26
+      and "turn" not in partial_done, "D3 review 6: retain known context even when the turn baseline was outside the window")
 
 # ================================================================== E. new-turn transport (fake codex)
 S = sid_n(30)
 hook(S, "UserPromptSubmit", prompt="setup")  # records the session cwd
 hook(S, "Stop", last_assistant_message="ok")
+exec_calls = os.path.join(TMP, "exec_calls.jsonl")
+open(exec_calls, "w").close()
 app_consumes(S)
 t0 = time.time()
-r = send("mgr-e1", S, "app takes it")
+r = send("mgr-e1", S, "app takes it", "--model", "app-choice")
 check(r["transport"] == "app" and time.time() - t0 < 2.5, "E auto: App takes the queued message -> transport app")
+with open(exec_calls) as f:
+    check(not f.read() and r.get("ignored_exec_options") == ["--model"] and "exec_settings" not in r
+          and record(S).get("exec_settings") == {"model": "app-choice"},
+          "E App delivery ignores the model for this turn and saves it for later exec")
 time.sleep(1.5)
 set_mode("writer")
 r = send("mgr-e1", S, "app holds it but is busy")
@@ -528,13 +724,19 @@ check(r["transport"] == "app" and "note" in r, "E auto: exec sees active writer 
 S = sid_n(31)
 hook(S, "UserPromptSubmit", prompt="setup")
 hook(S, "Stop", last_assistant_message="ok")
+fake_rollout(S, "setup", [], "auto-model", "low")
 set_mode("run")
 open(os.path.join(TMP, "exec_calls.jsonl"), "w").close()
-r = send("mgr-e2", S, "nobody serves it")
+r = send("mgr-e2", S, "nobody serves it", "--effort", "high")
 calls = [json.loads(l) for l in open(os.path.join(TMP, "exec_calls.jsonl"))]
 check(r.get("transport") == "exec" and queued(S) == 0, "E auto: App doesn't take it -> exec drains the queue")
 check(calls and os.path.realpath(calls[-1]["cwd"]) == WORKDIR and calls[-1]["prompt"] == cm.EXEC_NUDGE,
       "E exec runs in the session's cwd with the nudge prompt")
+check(r.get("exec_settings") == {"model": {"value": "auto-model", "source": "rollout"},
+                                 "effort": {"value": "high", "source": "explicit"}}
+      and calls[-1]["args"] == ["exec", "resume", "--json", "--skip-git-repo-check", "-m", "auto-model",
+                                "-c", 'model_reasoning_effort="high"', S, cm.EXEC_NUDGE],
+      "E auto fallback passes the rollout model and explicit effort to exec")
 time.sleep(1.5)
 r = listen("mgr-e2")
 check(by_thread(r).get(S, {}).get("last_message") == "exec done", "E listen reports the exec turn's stop")
@@ -548,9 +750,11 @@ r = send("mgr-e2", S, "direct", "--via", "exec")
 check(r["_rc"] == 1 and r.get("active_writer") and record(S)["expect"] == [],
       "E --via exec with the App holding the session -> error, nothing pending")
 set_mode("fail")
-r = send("mgr-e2", S, "broken exec")
+r = send("mgr-e2", S, "broken exec", "--model", "queued-model", "--effort", "medium")
 check(r.get("ok") is True and r.get("transport") == "queued" and r.get("exec_error"),
       "E exec failure leaves the message queued for the App")
+check(r.get("ignored_exec_options") == ["--model", "--effort"] and "exec_settings" not in r,
+      "E queued delivery reports both options unapplied after exec fails")
 S = sid_n(32)
 hook(S, "UserPromptSubmit", prompt="setup")
 hook(S, "Stop", last_assistant_message="ok")
@@ -570,6 +774,371 @@ r2 = listen("mgr-e4")
 st = by_thread(r2).get(S, {})
 check(r.get("transport") == "exec" and st.get("reason") == "not_started" and st.get("exec_exit"),
       "E exec exits before starting a turn -> not_started at once")
+set_mode("run")
+
+# ================================================================== E2. new session (fake codex)
+MN = "mgr-new"
+set_mode("new-started")
+msg = "执行第一轮\n保留第二行\n"
+r = cli(MN, "new", "--codex", FAKE, "--label", "first", "--model", "test-model", "--effort", "high",
+        "--cwd", WORKDIR, "--search", "--checkin", "off", stdin=msg)
+with open(os.path.join(TMP, "new_calls.jsonl")) as f:
+    call = json.loads(f.readline())
+sid = call["thread"]
+expected = ["exec", "--json", "-m", "test-model", "-c", 'model_reasoning_effort="high"',
+            "-c", 'web_search="live"', "--skip-git-repo-check", "-C", WORKDIR, "--", msg]
+check(call["args"] == expected and call["devnull"] and call["detached"] and call["hook_dir"] == BOX,
+      "E2 new passes stdin as an argument, detaches with /dev/null and sets the hook data directory")
+check(r["ok"] and r["_rc"] == 0 and r["thread"] == sid and r["claimed"] and r["label"] == "first"
+      and not r["listening"] and r["cwd"] == WORKDIR and r["exec_pid"] == call["pid"]
+      and os.path.dirname(r["exec_log"]) == os.path.join(BOX, sid),
+      "E2 new parses the real split thread.started line, claims it and moves the session log")
+st = cli(MN, "status", "--thread", sid)
+check(st["codex"]["reason"] == "working" and st["pending_sends"] == [] and st["checkin_s"] == 0
+      and st["exec"]["alive"] and st["exec"]["log"] == r["exec_log"] and st["exec"]["pid"] == r["exec_pid"],
+      "E2 a prompt logged before claim is already working, and the detached run survives new")
+open(os.path.join(TMP, "finish-new"), "w").close()
+st = by_thread(listen(MN, "--start-timeout", "0.1")).get(sid, {})
+check(st.get("reason") == "done" and st.get("last_message") == "第一轮已完成",
+      "E2 listen reports done when the prompt started before claim")
+check(record(sid).get("exec_settings") == {"model": "test-model", "effort": "high"},
+      "E2 new saves both explicit settings in the session record")
+set_mode("quiet")
+r = send(MN, sid, "resume after new", "--via", "exec")
+check(r.get("exec_settings") == {"model": {"value": "test-model", "source": "session"},
+                                 "effort": {"value": "high", "source": "session"}}
+      and last_resume_args()[4:-2] == expected[2:6],
+      "E2 resume after new uses the saved settings with the same argument quoting")
+listen(MN, "--settle", "0")
+
+set_mode("new-finished")
+r = cli(MN, "new", "--codex", FAKE, "--message=--首轮消息")
+with open(os.path.join(TMP, "new_calls.jsonl")) as f:
+    call = json.loads(f.readlines()[-1])
+sid = call["thread"]
+check(r["ok"] and r["thread"] == sid and r["cwd"] == os.getcwd()
+      and call["args"] == ["exec", "--json", "--skip-git-repo-check", "-C", os.getcwd(), "--", "--首轮消息"]
+      and "exec_settings" not in record(sid),
+      "E2 new uses the current directory and omits model, effort and search by default")
+box = cm.Session(BOX, sid)
+events = box.events()
+check([e["ev"] for e in events] == ["UserPromptSubmit", "Stop"]
+      and all(record(sid)["reported"] < e["t"] for e in events)
+      and record(sid)["expect"][0]["t"] < events[0]["t"],
+      "E2 the pre-claim stop and prompt both follow the initial cursor")
+st = by_thread(listen(MN, "--start-timeout", "0.1")).get(sid, {})
+check(st.get("reason") == "done" and st.get("last_message") == "第一轮已完成"
+      and listen(MN, "--timeout", "0.3")["reason"] == "timeout",
+      "E2 a turn already finished before claim reports done once")
+
+for mode, reason in [("new-crash", "ended"), ("new-quiet", "not_started")]:
+    set_mode(mode)
+    r = cli(MN, "new", "--codex", FAKE, "--message", "run")
+    st = by_thread(listen(MN)).get(r["thread"], {})
+    check(r["ok"] and st.get("reason") == reason and st.get("exec_log") == r["exec_log"],
+          "E2 new run exits after thread id: " + reason)
+
+MF = "mgr-new-fail"
+set_mode("new-fail")
+r = cli(MF, "new", "--codex", FAKE, "--message", "will fail")
+check(r["_rc"] == 1 and not r["ok"] and not r["thread"] and not r["claimed"] and "7" in r["error"]
+      and "fake startup failure" in r["log_tail"] and not cm.pid_alive(r["exec_pid"]),
+      "E2 early exit returns its error and stderr without claiming")
+
+set_mode("new-timeout")
+new_out = io.StringIO()
+with patch.object(cm, "NEW_START_TIMEOUT", 0.8), contextlib.redirect_stdout(new_out):
+    rc = cm.main(["--dir", BOX, "--manager", MF, "new", "--codex", FAKE, "--message", "will time out"])
+r = json.loads(new_out.getvalue())
+check(rc == 1 and not r["ok"] and not r["thread"] and not r["claimed"] and "超时" in r["error"]
+      and "fake exec startup" in r["log_tail"] and not cm.pid_alive(r["exec_pid"])
+      and listen(MF)["reason"] == "nothing_to_watch",
+      "E2 startup timeout kills and reaps the live child without claiming")
+failed_log = r["exec_log"]
+set_mode("run")
+
+# ================================================================== E4. exec settings precedence and rollout lookup
+MS, SS = "mgr-exec-settings", sid_n(55)
+set_mode("quiet")
+turn(SS, "setup", "ready")
+fake_rollout(SS, "setup", [], "rollout-model", "low")
+box = cm.Session(BOX, SS)
+box.edit_record(lambda rec: rec.update(exec_settings={"model": "saved-model", "effort": "medium"}))
+r = send(MS, SS, "override model only", "--via", "exec", "--model", "explicit-model")
+check(r.get("exec_settings") == {"model": {"value": "explicit-model", "source": "explicit"},
+                                 "effort": {"value": "medium", "source": "session"}}
+      and record(SS).get("exec_settings") == {"model": "explicit-model", "effort": "medium"},
+      "E4 explicit model replaces the saved model and preserves the saved effort")
+r = send(MS, SS, "reuse model", "--via", "exec", "--effort", "high")
+check(r.get("exec_settings") == {"model": {"value": "explicit-model", "source": "session"},
+                                 "effort": {"value": "high", "source": "explicit"}}
+      and last_resume_args() == ["exec", "resume", "--json", "--skip-git-repo-check", "-m", "explicit-model",
+                                 "-c", 'model_reasoning_effort="high"', SS, "reuse model"],
+      "E4 later send uses the saved model and an explicit effort overrides session and rollout")
+
+SS = sid_n(56)
+turn(SS, "setup", "ready")
+fake_rollout(SS, "earlier", [], "older-model", "medium")
+fake_rollout(SS, "setup", [], "long-model", None)
+append_rollout(SS, filler, filler)
+box = cm.Session(BOX, SS)
+r = send(MS, SS, "resume long rollout", "--via", "exec")
+check(r.get("exec_settings") == {"model": {"value": "long-model", "source": "rollout"},
+                                 "effort": {"value": "medium", "source": "rollout"}}
+      and last_resume_args()[4:-2] == ["-m", "long-model", "-c", 'model_reasoning_effort="medium"'],
+      "E4 long rollout supplies the latest nonempty value of each setting")
+with patch.object(cm, "rollout_rows", wraps=cm.rollout_rows) as read_blocks:
+    check(cm.rollout_settings(box) == {"model": "long-model", "effort": "medium"} and not read_blocks.called,
+          "E4 unchanged rollout reuses the settings cache without reading blocks")
+fake_rollout(SS, "later", [], "newer-model", None)
+with patch.object(cm, "rollout_rows", wraps=cm.rollout_rows) as read_blocks:
+    check(cm.rollout_settings(box) == {"model": "newer-model", "effort": "medium"} and read_blocks.call_count == 1,
+          "E4 appended context replaces only its nonempty value using the cached offset")
+with patch.object(cm, "ROLLOUT_USAGE_LIMIT", cm.ROLLOUT_TAIL):
+    cached_settings = cm.rollout_settings(box)
+    check(cached_settings == {"model": "newer-model", "effort": "medium"},
+          "E4 review 8: settings already cached survive the lookup window moving past them (values: %s)"
+          % cached_settings)
+fake_rollout(SS, "wide-append", [], "model-in-append", None)
+append_rollout(SS, *large_append)
+r = send(MS, SS, "resume after large append", "--via", "exec")
+check(r.get("exec_settings") == {"model": {"value": "model-in-append", "source": "rollout"},
+                                 "effort": {"value": "medium", "source": "rollout"}}
+      and last_resume_args()[4:-2] == ["-m", "model-in-append", "-c", 'model_reasoning_effort="medium"'],
+      "E4 review 8: exec uses settings from the cache and the entire >64 MiB append (sources: %s)"
+      % {key: item["source"] for key, item in r.get("exec_settings", {}).items()})
+
+SS = sid_n(57)
+turn(SS, "setup", "ready")
+fake_rollout(SS, "setup", [], "model-without-effort", None)
+r = send(MS, SS, "resume null effort", "--via", "exec")
+check(r.get("exec_settings") == {"model": {"value": "model-without-effort", "source": "rollout"},
+                                 "effort": {"value": None, "source": "config"}}
+      and last_resume_args()[4:-2] == ["-m", "model-without-effort"],
+      "E4 null effort without earlier evidence omits the config override")
+SS = sid_n(58)
+turn(SS, "setup", "ready")
+r = send(MS, SS, "resume with config", "--via", "exec")
+check(r.get("exec_settings") == {key: {"value": None, "source": "config"} for key in ("model", "effort")}
+      and last_resume_args() == ["exec", "resume", "--json", "--skip-git-repo-check", SS, "resume with config"],
+      "E4 missing session and rollout settings fall back to config without either flag")
+set_mode("run")
+
+# ================================================================== E3. exec exit races and missing hook diagnostics
+@contextlib.contextmanager
+def capture_exec_children():
+    children = []
+    popen = subprocess.Popen
+
+    def capture_child(argv, *args, **kwargs):
+        proc = popen(argv, *args, **kwargs)
+        if argv[:2] == [FAKE, "exec"]:
+            children.append(proc)
+        return proc
+
+    try:
+        with patch.object(cm.subprocess, "Popen", side_effect=capture_child):
+            yield children
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.terminate()
+                child.wait(timeout=5)
+
+
+def check_exec_exit_race(mode, initial, message):
+    manager = "mgr-" + mode
+    set_mode(mode)
+    with capture_exec_children() as children:
+        if mode == "resume-race":
+            thread = sid_n(34)
+            turn(thread, "before-exec", "old result")
+            sent = local_cli(manager, "send", "--thread", thread, "--codex", FAKE, "--message", "run",
+                             "--app-timeout", "0")
+        else:
+            sent = local_cli(manager, "new", "--codex", FAKE, "--message", "run")
+            thread = sent["thread"]
+        assert sent["ok"] and sent["transport"] == "exec" and len(children) == 1, sent
+        box = cm.Session(BOX, thread)
+        started = box.record()["exec"]["started"]
+        old_snapshots = []
+        read = cm.EventLog.read
+
+        def read_then_finish(log):
+            events = read(log)
+            if log.path == box.events_path and not old_snapshots:
+                old_snapshots.append([e["ev"] for e in events if e["t"] > started])
+                open(os.path.join(TMP, "finish-" + mode), "w").close()
+                assert children[0].wait(timeout=5) == 0
+            return events
+
+        with patch.object(cm.EventLog, "read", read_then_finish):
+            report = local_cli(manager, "listen", "--settle", "0", "--timeout", "1")
+    stop = by_thread(report).get(thread, {})
+    again = listen(manager, "--timeout", "0.2")
+    check(old_snapshots == [initial] and stop.get("reason") == "done" and stop.get("last_message") == message
+          and again["reason"] == "timeout" and not again["stops"] and record(thread)["reported"] == box.events()[-1]["t"],
+          "E3 exec exit race preserves done and last_message exactly once: " + mode)
+
+
+check_exec_exit_race("new-race-empty", [], "第一轮已完成")
+check_exec_exit_race("new-race-started", ["UserPromptSubmit"], "第一轮已完成")
+check_exec_exit_race("resume-race", ["UserPromptSubmit"], "exec done")
+
+MR, SR = "mgr-late-stop", sid_n(35)
+cli(MR, "claim", "--thread", SR)
+race_box = cm.Session(BOX, SR)
+started = time.time()
+race_box.log_event(E(started + 1, "UserPromptSubmit", turn="late-stop"))
+race_log = os.path.join(race_box.root, "exec-test.log")
+open(race_log, "w").close()
+os.utime(race_log, (started + 10, started + 10))
+proc = subprocess.Popen(["true"])
+proc.wait()
+cm.record_exec(race_box, {"exec_pid": proc.pid, "_started": started, "_log": race_log})
+first = by_thread(listen(MR, "--settle", "0")).get(SR, {})
+race_box.log_event(E(started + 2, "Stop", turn="late-stop", msg="late real stop"))
+second = by_thread(listen(MR, "--settle", "0", "--timeout", "0.5")).get(SR, {})
+check(first.get("reason") == "ended" and second.get("reason") == "done"
+      and second.get("last_message") == "late real stop",
+      "E3 a synthetic exit does not advance the report cursor past a later-read real Stop")
+
+set_mode("new-stop-only")
+r = cli(MF, "new", "--codex", FAKE, "--message", "run without a prompt hook")
+stop = by_thread(listen(MF)).get(r["thread"], {})
+check(stop.get("reason") == "done" and stop.get("last_message") == "第一轮已完成",
+      "E3 a final Stop takes priority when the exec prompt hook is missing")
+
+for mode, reason in [("new-completed-no-hooks", "not_started"), ("new-completed-no-stop", "ended")]:
+    set_mode(mode)
+    r = cli(MF, "new", "--codex", FAKE, "--message", "run without hook records")
+    stop = by_thread(listen(MF, "--settle", "0")).get(r["thread"], {})
+    check(stop.get("reason") == reason and "exec 日志显示本轮已完成，但 hooks 没有记录到，先跑 doctor" in stop["summary"]
+          and "last_message" not in stop, "E3 exec completion without hook records adds a doctor hint: " + reason)
+set_mode("run")
+
+# ================================================================== E5. review regressions at the CLI boundary
+MR = "mgr-live-stop-only"
+set_mode("new-stop-only-wait")
+with capture_exec_children() as children:
+    r = local_cli(MR, "new", "--codex", FAKE, "--message", "finish before the prompt hook")
+    SR = r["thread"]
+    race_box = cm.Session(BOX, SR)
+    real_stop = race_box.events()[0]
+    before = race_box.record()["reported"]
+    expiry = real_stop["t"] - before + 0.025
+    time.sleep(max(0, before + expiry - time.time()))
+    st = cli(MR, "status", "--thread", SR)
+    first = by_thread(listen(MR, "--settle", "0", "--start-timeout", str(expiry), "--timeout", "0.5")).get(SR, {})
+    after = race_box.record()["reported"]
+    check(st["codex"]["reason"] == "done" and st["exec"]["alive"] and children[0].poll() is None
+          and first.get("reason") == "done" and first.get("last_message") == "第一轮已完成" and after == real_stop["t"],
+          "E5 review 1: live exec's real Stop wins at the start deadline (listen: %s, cursor past Stop: %s)"
+          % (first.get("reason"), after > real_stop["t"]))
+    open(os.path.join(TMP, "finish-new-stop-only-wait"), "w").close()
+    assert children[0].wait(timeout=5) == 0
+r = listen(MR, "--settle", "0", "--start-timeout", str(expiry), "--timeout", "0.3")
+check(r["reason"] == "timeout" and not r["stops"], "E5 the first Stop is not repeated after exec exits")
+
+MR = "mgr-next-send-queued"
+set_mode("new-started")
+finish_new = os.path.join(TMP, "finish-new")
+os.remove(finish_new)
+with capture_exec_children() as children:
+    r = local_cli(MR, "new", "--codex", FAKE, "--message", "run first")
+    SR = r["thread"]
+    sent = send(MR, SR, "wait in the App queue", "--queue", "--via", "app")
+    race_box = cm.Session(BOX, SR)
+    next_send = next(x for x in race_box.record()["expect"] if x["id"] == sent["id"])
+    open(finish_new, "w").close()
+    assert children[0].wait(timeout=5) == 0
+st = cli(MR, "status", "--thread", SR)
+real_stop = race_box.events()[-1]
+r = listen(MR, "--settle", "0", "--timeout", "0.4")
+first = by_thread(r).get(SR, {})
+watch = by_thread(r, "watching").get(SR, {})
+check(st["codex"]["reason"] == "done" and queued(SR) == 1 and first.get("reason") == "done"
+      and first.get("last_message") == "第一轮已完成" and watch.get("state") == "waiting_start",
+      "E5 review 2: first managed Stop is reported while the next send waits (listen: %s)" % r["reason"])
+expiry = real_stop["t"] - next_send["t"] + 0.025
+r = listen(MR, "--settle", "0", "--start-timeout", str(expiry), "--timeout", "0.7")
+second = by_thread(r).get(SR, {})
+check(second.get("reason") == "not_started" and [x["id"] for x in second["queued"]] == [sent["id"]]
+      and race_box.record()["reported"] == real_stop["t"],
+      "E5 review 2: only the queued send times out and the hook cursor stays on the first Stop")
+r = listen(MR, "--settle", "0", "--start-timeout", str(expiry), "--timeout", "0.3")
+check(r["reason"] == "timeout" and not r["stops"], "E5 neither the first Stop nor the next send timeout is repeated")
+
+for via in ("exec", "auto"):
+    MR = "mgr-resume-stop-only-" + via
+    set_mode("new-finished")
+    r = cli(MR, "new", "--codex", FAKE, "--message", "first turn", "--cwd", WORKDIR)
+    SR = r["thread"]
+    first = by_thread(listen(MR, "--settle", "0")).get(SR, {})
+    assert first.get("last_message") == "第一轮已完成", first
+    set_mode("resume-stop-only")
+    sent = send(MR, SR, "resume with Stop alone", "--via", via, "--app-timeout", "0")
+    st = cli(MR, "status", "--thread", SR)
+    events = cm.Session(BOX, SR).events()
+    stop = by_thread(listen(MR, "--settle", "0", "--start-timeout", "0", "--timeout", "0.5")).get(SR, {})
+    again = listen(MR, "--timeout", "0.3")
+    check(sent["transport"] == "exec" and queued(SR) == 0 and [e["ev"] for e in events] == ["UserPromptSubmit", "Stop", "Stop"]
+          and st["codex"].get("turn_id") == "resume-turn" and not st["pending_sends"] and stop.get("reason") == "done"
+          and stop.get("last_message") == "resume without prompt hook" and again["reason"] == "timeout",
+          "E5 review 3: resume Stop without its prompt supersedes the previous turn via %s (status turn: %s, listen: %s)"
+          % (via, st["codex"].get("turn_id"), stop.get("reason")))
+    check(cli(MR, "status", "--thread", SR)["codex"].get("last_message") == "resume without prompt hook",
+          "E5 review 3: reported resume result stays current via " + via)
+    hook(SR, "UserPromptSubmit", turn="app-after-resume", prompt="later in App")
+    st = cli(MR, "status", "--thread", SR)
+    check(st["codex"]["reason"] == "working" and not st["unreported"],
+          "E5 a resume with no prompt hook does not end the next App turn via " + via)
+    hook(SR, "Stop", turn="app-after-resume", last_assistant_message="later App done")
+    check(by_thread(listen(MR, "--settle", "0", "--timeout", "0.5")).get(SR, {}).get("last_message") == "later App done",
+          "E5 the next App turn still reports its own Stop via " + via)
+
+MR = "mgr-ended-no-repeat"
+set_mode("new-crash")
+r = cli(MR, "new", "--codex", FAKE, "--message", "crash after prompt")
+SR = r["thread"]
+first = by_thread(listen(MR, "--settle", "0")).get(SR, {})
+st = cli(MR, "status", "--thread", SR)
+r = listen(MR, "--settle", "0", "--stall", "0", "--timeout", "0.4")
+check(first.get("reason") == "ended" and st["codex"]["reason"] == "ended" and not st["unreported"]
+      and r["reason"] == "timeout" and not r["stops"],
+      "E5 review 4: one exec exit never becomes working or stalled (status: %s, next stop: %s)"
+      % (st["codex"]["reason"], by_thread(r).get(SR, {}).get("reason")))
+hook(SR, "SessionEnd", turn="exec-turn")  # older hook registrations can still write this event
+check(listen(MR, "--settle", "0", "--stall", "0", "--timeout", "0.3")["reason"] == "timeout",
+      "E5 review 4: a legacy SessionEnd cannot repeat the reported exit")
+hook(SR, "Stop", turn="exec-turn", last_assistant_message="late Stop after ended")
+late = by_thread(listen(MR, "--settle", "0", "--timeout", "0.5")).get(SR, {})
+check(late.get("reason") == "done" and late.get("last_message") == "late Stop after ended"
+      and listen(MR, "--settle", "0", "--stall", "0", "--timeout", "0.3")["reason"] == "timeout",
+      "E5 review 4: a real late Stop still reports exactly once after ended")
+
+MR = "mgr-exec-data-dir"
+other_dir = os.path.join(TMP, "other-intercom-dir")
+relative_dir = os.path.relpath(BOX)
+with patch.dict(os.environ, {"CODEX_INTERCOM_DIR": other_dir}):
+    set_mode("new-finished")
+    r = cli(MR, "new", "--codex", FAKE, "--message", "dir first turn", "--cwd", WORKDIR, data_dir=relative_dir)
+    SR = r["thread"]
+    first = by_thread(listen(MR, "--settle", "0")).get(SR, {})
+    set_mode("resume-race")  # finish signal is already present from E3
+    sent = cli(MR, "send", "--thread", SR, "--codex", FAKE, "--message", "dir resume", "--app-timeout", "0",
+               data_dir=relative_dir)
+    stop = by_thread(listen(MR, "--settle", "0", "--start-timeout", "0", "--timeout", "0.5")).get(SR, {})
+with open(os.path.join(TMP, "new_calls.jsonl")) as f:
+    new_call = json.loads(f.readlines()[-1])
+with open(os.path.join(TMP, "exec_calls.jsonl")) as f:
+    resume_call = json.loads(f.readlines()[-1])
+other_events = cm.Session(other_dir, SR).events()
+check(first.get("last_message") == "第一轮已完成" and sent.get("transport") == "exec"
+      and new_call["hook_dir"] == resume_call["hook_dir"] == BOX and resume_call["cwd"] == WORKDIR
+      and not other_events and stop.get("last_message") == "exec done",
+      "E5 review 5: new and resume export the same absolute --dir over the environment (stray hooks: %d, listen: %s)"
+      % (len(other_events), stop.get("reason")))
 set_mode("run")
 
 # ================================================================== F. App popup questions, gate
@@ -634,9 +1203,10 @@ check(st["codex"]["reason"] == "asking" and st["blocked_by_question"] is True
       "F popup open at the stop -> asking, blocked")
 open(os.path.join(TMP, "exec_calls.jsonl"), "w").close()
 t0 = time.time()
-r = send("mgr-f3", S, "顺便把日志也看一下")
+r = send("mgr-f3", S, "顺便把日志也看一下", "--model", "blocked-model")
 check(r["transport"] == "blocked" and r["blocked_by_question"] and time.time() - t0 < 2
-      and not open(os.path.join(TMP, "exec_calls.jsonl")).read(),
+      and not open(os.path.join(TMP, "exec_calls.jsonl")).read()
+      and r.get("ignored_exec_options") == ["--model"] and "exec_settings" not in r,
       "F send while the popup blocks -> queued, flagged, no App wait, no exec")
 r = listen("mgr-f3", "--start-timeout", "1")
 st = by_thread(r).get(S, {})
@@ -679,10 +1249,14 @@ check(d["ok"] is False, "G doctor flags a missing install")
 OLDW = os.path.join(BOX, sid_n(12), "watch.json")
 open(OLDW, "w").write("{}")
 os.utime(OLDW, (time.time() - cm.MANAGED_TTL - 10,) * 2)
+past = time.time() - cm.NEW_START_TIMEOUT - 5
+os.utime(failed_log, (past, past))
 r = cli("mgr-g", "gc", "--days", "0")
 check(r["legacy_files_removed"] >= 1 and not os.path.exists(os.path.join(BOX, sid_n(12), "watch.json"))
       and os.path.isdir(os.path.join(BOX, sid_n(12))) and not os.path.isdir(os.path.join(BOX, sid_n(11))),
       "G gc removes legacy files and unowned old sessions, keeps owned ones")
+check(r["new_exec_logs_removed"] >= 1 and not os.path.exists(failed_log),
+      "G gc removes failed startup logs after they age out")
 
 print("\n%d failure(s); tmp=%s" % (len(FAILS), TMP))
 sys.exit(1 if FAILS else 0)

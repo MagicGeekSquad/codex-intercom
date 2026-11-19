@@ -99,7 +99,7 @@ sequenceDiagram
 |---|---|
 | OS | macOS or Linux (Windows is not supported) |
 | Python | 3.9+, standard library only (`/usr/bin/python3` on macOS works) |
-| Codex | [Codex CLI](https://github.com/openai/codex) with hooks (tested with `codex-cli` 0.167.2 and 0.169.0); the Codex App is optional |
+| Codex | [Codex CLI](https://github.com/openai/codex) with hooks (tested with `codex-cli` 0.167.2, 0.169.0 and 0.170.0); the Codex App is optional |
 | Claude Code | any recent version (uses skills and background Bash tasks) |
 
 ## Installation
@@ -178,10 +178,11 @@ script lives under `~/.claude/plugins/`).
 
 | Command | What it does |
 |---|---|
-| `CI send --thread <id> --message "…"` | Deliver a message and take ownership of the session. Options: `--label NAME`, `--checkin 10m\|1h\|off`, `--queue` (never steer), `--via auto\|app\|exec`, `--take-over`. Reads stdin when `--message` is omitted. |
+| `CI new --label NAME --message "…"` | Start a Codex session with its first task in a detached exec and claim the returned thread ID. Options: `--cwd DIR`, `--model M`, `--effort E`, `--search`, `--checkin`. Reads stdin when `--message` is omitted. Exec-started sessions don't show up in the Codex App. |
+| `CI send --thread <id> --message "…"` | Deliver a message and take ownership of the session. Options: `--label NAME`, `--checkin 10m\|1h\|off`, `--queue` (never steer), `--via auto\|app\|exec`, `--take-over`, `--model M` / `--effort E` (for exec resume). Reads stdin when `--message` is omitted. |
 | `CI listen` | Block until any owned session needs attention, print one JSON line, exit. Run in the background; one per manager. Options: `--checkin 30m`, `--timeout N`. |
 | `CI list` | Your sessions and their state (`working`, `waiting_start`, `stopped` + reason). `--all` shows every managed session and its manager. |
-| `CI status --thread <id>` | One session in detail: owner, current state, progress snapshot, unreported stops, pending sends, popups, exec run, queue. |
+| `CI status --thread <id>` | Inspect the owner, current state, progress, recorded model and token usage, unreported stops, pending sends, popups, exec run and queue. |
 | `CI claim --thread <id>` / `CI release --thread <id>` | Start managing a session without sending / hand it back (popups allowed again). |
 | `CI doctor [--thread <id>]` | Check the installation and recent hook activity. |
 | `CI install` / `CI uninstall [--remove-script]` | Register / remove the Codex hooks (`hooks.json` is backed up first). |
@@ -243,6 +244,9 @@ Timing flags (on `send`, `listen`, `list`, `status`): `--error-grace 15`, `--app
 No. With the App, messages for sessions it has open are picked up there and you can watch them live.
 Without it (or when the App doesn't have that session open), codex-intercom runs the turn headless with
 `codex exec resume` in the session's original working directory. Mid-turn steering works for both.
+Headless turns keep the session's model and reasoning effort: codex-intercom passes them explicitly,
+because `codex exec resume` alone falls back to your `config.toml` defaults
+([openai/codex#32061](https://github.com/openai/codex/issues/32061)).
 </details>
 
 <details>
@@ -292,7 +296,7 @@ Codex reads them fine too. Translations are welcome as pull requests.
 
 Core behaviour depends only on documented Codex hooks and CLI commands. Two extras are best-effort:
 detecting whether the App took a queued message (reads Codex's queue database, read-only) and the
-progress snapshot (reads Codex's session log). If either format changes, those extras degrade
+progress snapshot and usage (read from Codex's session log). If either format changes, those extras degrade
 gracefully; stop detection keeps working. Run `doctor` after upgrading Codex.
 </details>
 
@@ -328,7 +332,7 @@ install.sh / uninstall.sh                      installers
 ```
 
 ```bash
-python3 tests/test_intercom.py          # ~125 checks, a few minutes
+python3 tests/test_intercom.py          # ~200 checks, a few minutes
 ```
 
 The script's module docstring is the design reference: the data model, how attention is derived, and
