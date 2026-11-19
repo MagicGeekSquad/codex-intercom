@@ -11,6 +11,7 @@ import importlib.util
 import io
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -926,7 +927,7 @@ set_mode("run")
 
 # ================================================================== E3. exec exit races and missing hook diagnostics
 @contextlib.contextmanager
-def capture_exec_children():
+def capture_exec_children(on_spawn=None):
     children = []
     popen = subprocess.Popen
 
@@ -934,6 +935,8 @@ def capture_exec_children():
         proc = popen(argv, *args, **kwargs)
         if argv[:2] == [FAKE, "exec"]:
             children.append(proc)
+            if on_spawn is not None:
+                on_spawn(proc)
         return proc
 
     try:
@@ -1257,6 +1260,349 @@ check(r["legacy_files_removed"] >= 1 and not os.path.exists(os.path.join(BOX, si
       "G gc removes legacy files and unowned old sessions, keeps owned ones")
 check(r["new_exec_logs_removed"] >= 1 and not os.path.exists(failed_log),
       "G gc removes failed startup logs after they age out")
+
+# ================================================================== H. stop report races
+def test_listen_preserves_stop_during_settle(next_state, number):
+    manager = "mgr-stop-settle-" + next_state
+    sid, other = sid_n(number), sid_n(number + 1)
+    for thread in (sid, other):
+        cli(manager, "claim", "--thread", thread)
+    turn(sid, "A", "A result")
+    initial, status = [], {}
+    scan = cm.scan
+
+    def scan_then_start_next(*args):
+        result = scan(*args)
+        if not initial:
+            initial.append(by_thread({"stops": result[1]}).get(sid, {}))
+            if next_state == "queued":
+                assert send(manager, sid, "waiting send", "--queue", "--via", "app")["transport"] == "app"
+            hook(sid, "UserPromptSubmit", turn="B", prompt="B")
+            if next_state == "done":
+                hook(sid, "Stop", turn="B", last_assistant_message="B result")
+            turn(other, "C", "C result")
+            status.update(cli(manager, "status", "--thread", sid))
+        return result
+
+    with patch.object(cm, "scan", side_effect=scan_then_start_next):
+        report = local_cli(manager, "listen", "--settle", "0.02", "--poll", "0.02", "--timeout", "1")
+    stops = by_thread(report)
+    stop = stops.get(sid, {})
+    watch = by_thread(report, "watching").get(sid, {})
+    unreported = (status.get("unreported") or {}).get("last_message")
+    again = listen(manager, "--settle", "0", "--timeout", "0.2")
+    if next_state == "working":
+        hook(sid, "Stop", turn="B", last_assistant_message="B result")
+        later = by_thread(listen(manager, "--settle", "0", "--timeout", "0.5")).get(sid, {})
+        expected = (status["codex"]["reason"] == "working" and unreported == "A result"
+                    and stop.get("last_message") == "A result" and "earlier_stops" not in stop
+                    and watch.get("state") == "working" and later.get("last_message") == "B result"
+                    and "earlier_stops" not in later)
+    elif next_state == "done":
+        expected = unreported == "B result" and stop.get("last_message") == "B result" and stop.get("earlier_stops") == 1
+    else:
+        expected = unreported is None and sid not in stops and watch.get("state") == "waiting_start"
+    check(initial[0].get("last_message") == "A result" and stops.get(other, {}).get("last_message") == "C result"
+          and expected and again["reason"] == "timeout" and not again["stops"],
+          "P1-01 test_listen_preserves_stop_during_settle (%s): unreported=%r, stop=%r, watching=%s"
+          % (next_state, unreported, stop.get("last_message"), watch.get("state")))
+
+
+def test_resume_records_fast_nonzero_exit(via, stop_before_exit, number):
+    manager = "mgr-fast-exit-%s-%s" % (via, stop_before_exit)
+    sid = sid_n(number)
+    turn(sid, "setup", "old result")
+    set_mode("resume-fast-exit-with-stop" if stop_before_exit else "resume-fast-exit")
+
+    def wait_for_exit(proc):
+        # The sender's first poll must see SIGTERM after all synchronous hooks have run.
+        assert proc.wait(timeout=5) == -signal.SIGTERM
+
+    with capture_exec_children(on_spawn=wait_for_exit):
+        sent = local_cli(manager, "send", "--thread", sid, "--codex", FAKE, "--message", "run", "--queue",
+                         "--via", via, "--app-timeout", "0")
+    hooks = [e["ev"] for e in cm.Session(BOX, sid).events() if e.get("turn") == "exec-turn"]
+    assert hooks == (["UserPromptSubmit", "Stop"] if stop_before_exit else ["UserPromptSubmit"])
+    ex = record(sid).get("exec") or {}
+    status = cli(manager, "status", "--thread", sid)
+    report = listen(manager, "--settle", "0", "--timeout", "0.5")
+    stop = by_thread(report).get(sid, {})
+    again = listen(manager, "--settle", "0", "--timeout", "0.2")
+    reason = "done" if stop_before_exit else "ended"
+    expected = stop.get("last_message") == "exec done" if stop_before_exit else bool(stop.get("exec_log"))
+    check(sent["ok"] and sent["transport"] == "exec" and queued(sid) == 0
+          and ex.get("send_id") == sent["id"] and ex.get("returncode") == -signal.SIGTERM
+          and (status.get("exec") or {}).get("alive") is False and not status["pending_sends"]
+          and (status["unreported"] or {}).get("reason") == reason
+          and stop.get("reason") == reason and expected and again["reason"] == "timeout",
+          "P1-04 test_resume_records_fast_nonzero_exit (%s, %s): ok=%s, transport=%s, queue=%s, exec=%s, listen=%s, stop=%s"
+          % (via, reason, sent["ok"], sent["transport"], queued(sid), bool(ex), report["reason"], stop.get("reason")))
+    set_mode("run")
+
+
+def test_listen_keeps_send_after_recoverable_stop(reason, number):
+    manager, sid = "mgr-recover-" + reason, sid_n(number)
+    a = send(manager, sid, "A", "--queue", "--via", "app")
+    app_take(sid)
+    hook(sid, "UserPromptSubmit", turn="A", prompt="A")
+    b = send(manager, sid, "B", "--queue", "--via", "app")
+    assert a["transport"] == b["transport"] == "app" and queued(sid) == 1
+    if reason == "error":
+        hook(sid, "PreModelRequest", turn="A")
+        hook(sid, "PostModelRequest", turn="A", status="failed", error="stream disconnected")
+    cfg = ("--error-grace", "0") if reason == "error" else ("--stall", "0")
+    first = listen(manager, "--settle", "0", "--timeout", "0.5", *cfg)
+    saved = [x["id"] for x in record(sid)["expect"]]
+    again = listen(manager, "--settle", "0", "--timeout", "0.2", *cfg)
+
+    hook(sid, "PreModelRequest", turn="A")
+    hook(sid, "PostModelRequest", turn="A", status="completed")
+    hook(sid, "Stop", turn="A", last_assistant_message="A recovered and finished")
+    recovered = listen(manager, "--settle", "0", "--timeout", "0.5")
+    stop = by_thread(recovered).get(sid, {})
+    watch = by_thread(recovered, "watching").get(sid, {})
+    pending = [x["id"] for x in record(sid)["expect"]]
+    assert queued(sid) == 1
+    app_take(sid)
+    turn(sid, "B", "B result")
+    last = by_thread(listen(manager, "--settle", "0", "--timeout", "0.5")).get(sid, {})
+    check(by_thread(first).get(sid, {}).get("reason") == reason and saved == [a["id"], b["id"]]
+          and by_thread(first, "watching").get(sid, {}).get("state") == "waiting_start"
+          and again["reason"] == "timeout" and stop.get("reason") == "done"
+          and stop.get("last_message") == "A recovered and finished" and watch.get("state") == "waiting_start"
+          and pending == [b["id"]] and last.get("last_message") == "B result" and "earlier_stops" not in last
+          and record(sid)["expect"] == [],
+          "P1-06 test_listen_keeps_send_after_recoverable_stop (%s): A retained=%s, next listen=%s, B earlier_stops=%s"
+          % (reason, a["id"] in saved, recovered["reason"], last.get("earlier_stops")))
+
+
+for number, next_state in enumerate(("working", "done", "queued"), 0):
+    test_listen_preserves_stop_during_settle(next_state, 61 + 2 * number)
+for number, (via, stop_before_exit) in enumerate((("exec", False), ("auto", False), ("exec", True), ("auto", True)), 67):
+    test_resume_records_fast_nonzero_exit(via, stop_before_exit, number)
+for number, reason in enumerate(("error", "stalled"), 71):
+    test_listen_keeps_send_after_recoverable_stop(reason, number)
+
+# ================================================================== I. independent review of stop report races
+RACE_LISTEN = ("--settle", "0", "--poll", "0.05", "--timeout", "0.3")
+
+
+def test_failed_resume_ignores_app_prompt(via, number):
+    manager, sid = "mgr-resume-fails-" + via, sid_n(number)
+    turn(sid, "setup", "ready")
+    set_mode("fail")
+
+    def start_app_before_exit(proc):
+        if via == "auto":
+            assert queued(sid) == 1
+            app_take(sid)
+        hook(sid, "UserPromptSubmit", turn="app-turn", prompt="App has started")
+        assert proc.wait(timeout=5) == 1
+
+    with capture_exec_children(on_spawn=start_app_before_exit):
+        sent = local_cli(manager, "send", "--thread", sid, "--codex", FAKE, "--message", "run", "--queue",
+                         "--via", via, "--app-timeout", "0")
+    status = cli(manager, "status", "--thread", sid)
+    report = listen(manager, *RACE_LISTEN)
+    watch = by_thread(report, "watching").get(sid, {})
+    fallback = sent["ok"] and sent["transport"] == "queued" and sent.get("exec_error") if via == "auto" else (
+        not sent["ok"] and sent["transport"] is None and sent.get("error"))
+    check(fallback and queued(sid) == 0 and status["exec"] is None and status["codex"]["reason"] == "working"
+          and status["unreported"] is None and report["reason"] == "timeout" and not report["stops"]
+          and watch.get("state") == "working",
+          "R2-1 test_failed_resume_ignores_app_prompt (%s): ok=%s, transport=%s, exec=%s, status=%s, listen=%s"
+          % (via, sent["ok"], sent["transport"], bool(status["exec"]), status["codex"]["reason"], report["reason"]))
+    set_mode("run")
+
+
+def test_started_resume_ignores_active_writer_text(via, number):
+    manager, sid = "mgr-resume-writer-text-" + via, sid_n(number)
+    turn(sid, "setup", "ready")
+    set_mode("resume-fast-exit-writer-text")
+
+    def wait_for_exit(proc):
+        assert proc.wait(timeout=5) == -signal.SIGTERM
+
+    with capture_exec_children(on_spawn=wait_for_exit):
+        sent = local_cli(manager, "send", "--thread", sid, "--codex", FAKE, "--message", "run", "--queue",
+                         "--via", via, "--app-timeout", "0")
+    ex = record(sid).get("exec") or {}
+    report = listen(manager, *RACE_LISTEN)
+    stop = by_thread(report).get(sid, {})
+    again = listen(manager, *RACE_LISTEN)
+    check(sent["ok"] and sent["transport"] == "exec" and not sent.get("active_writer") and queued(sid) == 0
+          and ex.get("returncode") == -signal.SIGTERM and ex.get("send_id") == sent["id"]
+          and stop.get("reason") == "ended" and stop.get("turn_id") == "exec-turn"
+          and again["reason"] == "timeout" and not again["stops"],
+          "R2-2 test_started_resume_ignores_active_writer_text (%s): ok=%s, transport=%s, exec=%s, listen=%s"
+          % (via, sent["ok"], sent["transport"], bool(ex), report["reason"]))
+    set_mode("run")
+
+
+def start_app_send_and_queue_next(manager, sid):
+    first = send(manager, sid, "A", "--queue", "--via", "app")
+    app_take(sid)
+    hook(sid, "UserPromptSubmit", turn="A", prompt="A")
+    second = send(manager, sid, "B", "--queue", "--via", "app")
+    assert first["transport"] == second["transport"] == "app" and queued(sid) == 1
+    return first["id"], second["id"]
+
+
+def test_listen_keeps_send_through_approval(reason, number):
+    manager, sid = "mgr-approval-after-" + reason, sid_n(number)
+    first_id, second_id = start_app_send_and_queue_next(manager, sid)
+    if reason == "error":
+        hook(sid, "PreModelRequest", turn="A")
+        hook(sid, "PostModelRequest", turn="A", status="failed", error="stream disconnected")
+    cfg = ("--error-grace", "0") if reason == "error" else ("--stall", "0")
+    first = by_thread(listen(manager, *RACE_LISTEN, *cfg)).get(sid, {})
+    hook(sid, "PreModelRequest", turn="A")
+    hook(sid, "PostModelRequest", turn="A", status="completed")
+    hook(sid, "PermissionRequest", turn="A", tool_name="Bash", tool_input={"command": "true"})
+    approval = listen(manager, *RACE_LISTEN, "--approval-grace", "0")
+    during_approval = [x["id"] for x in record(sid)["expect"]]
+    hook(sid, "Stop", turn="A", last_assistant_message="A finished after approval")
+    recovered = listen(manager, *RACE_LISTEN)
+    stop = by_thread(recovered).get(sid, {})
+    watch = by_thread(recovered, "watching").get(sid, {})
+    remaining = [x["id"] for x in record(sid)["expect"]]
+    assert queued(sid) == 1
+    app_take(sid)
+    turn(sid, "B", "B result")
+    last = by_thread(listen(manager, *RACE_LISTEN)).get(sid, {})
+    check(first.get("reason") == reason and by_thread(approval).get(sid, {}).get("reason") == "approval"
+          and during_approval == [first_id, second_id] and stop.get("last_message") == "A finished after approval"
+          and watch.get("state") == "waiting_start" and remaining == [second_id]
+          and last.get("last_message") == "B result" and "earlier_stops" not in last,
+          "R2-3 test_listen_keeps_send_through_approval (%s): A retained=%s, after approval=%s, B earlier_stops=%s"
+          % (reason, first_id in during_approval, recovered["reason"], last.get("earlier_stops")))
+
+
+def test_ended_acknowledges_earlier_stop():
+    manager, sid = "mgr-ended-acknowledges-earlier", sid_n(79)
+    cli(manager, "claim", "--thread", sid)
+    turn(sid, "A", "A result")
+    box = cm.Session(BOX, sid)
+    a_stop = box.events()[-1]
+    assert cli(manager, "status", "--thread", sid)["unreported"]["last_message"] == "A result"
+    set_mode("crash")
+    with capture_exec_children() as children:
+        sent = local_cli(manager, "send", "--thread", sid, "--codex", FAKE, "--message", "B", "--via", "exec")
+        assert sent["transport"] == "exec" and children[0].wait(timeout=5) == 0
+    b_prompt = box.events()[-1]
+    assert b_prompt["ev"] == "UserPromptSubmit" and b_prompt["turn"] == "exec-turn"
+    # Simulate a delayed read of a real Stop whose timestamp precedes the synthetic exit.
+    log_time = b_prompt["t"] + 10
+    os.utime(box.record()["exec"]["log"], (log_time, log_time))
+    first = by_thread(listen(manager, *RACE_LISTEN)).get(sid, {})
+    cursor = box.record()["reported"]
+    hook(sid, "UserPromptSubmit", turn="C", prompt="C")
+    after_c = listen(manager, *RACE_LISTEN)
+    box.log_event(E(b_prompt["t"] + 0.001, "Stop", turn="exec-turn", msg="late B result"))
+    recovered = by_thread(listen(manager, *RACE_LISTEN)).get(sid, {})
+    again = listen(manager, *RACE_LISTEN)
+    check(first.get("reason") == "ended" and first.get("earlier_stops") == 1 and cursor == a_stop["t"]
+          and after_c["reason"] == "timeout" and not after_c["stops"]
+          and by_thread(after_c, "watching").get(sid, {}).get("state") == "working"
+          and recovered.get("last_message") == "late B result" and "earlier_stops" not in recovered
+          and again["reason"] == "timeout" and not again["stops"],
+          "R2-4 test_ended_acknowledges_earlier_stop: earlier_stops=%s, cursor acknowledged A=%s, after C=%r, late B=%r"
+          % (first.get("earlier_stops"), cursor == a_stop["t"], by_thread(after_c).get(sid, {}).get("last_message"),
+             recovered.get("last_message")))
+    set_mode("run")
+
+
+def test_session_end_keeps_model_failure_streak():
+    manager, sid = "mgr-legacy-failure-streak", sid_n(80)
+    start_app_send_and_queue_next(manager, sid)
+    cfg = (*RACE_LISTEN, "--error-grace", "0")
+    hook(sid, "PreModelRequest", turn="A")
+    hook(sid, "PostModelRequest", turn="A", status="failed", error="first failure")
+    first = by_thread(listen(manager, *cfg)).get(sid, {})
+    hook(sid, "PreModelRequest", turn="A")
+    hook(sid, "PostModelRequest", turn="A", status="failed", error="retry failure")
+    retried = listen(manager, *cfg)
+    hook(sid, "SessionEnd", turn="A")
+    status = cli(manager, "status", "--thread", sid, "--error-grace", "0")
+    report = listen(manager, *cfg)
+    check(first.get("reason") == "error" and first.get("failures") == 1 and retried["reason"] == "timeout"
+          and status["codex"].get("failures") == 2 and status["codex"].get("error") == "retry failure"
+          and report["reason"] == "timeout" and not report["stops"] and queued(sid) == 1,
+          "R2-5 test_session_end_keeps_model_failure_streak: failures=%s, listen after SessionEnd=%s"
+          % (status["codex"].get("failures"), report["reason"]))
+
+
+def test_historical_stop_excludes_later_steer():
+    manager, sid, other = "mgr-historical-undelivered", sid_n(81), sid_n(82)
+    for thread in (sid, other):
+        cli(manager, "claim", "--thread", thread)
+    turn(sid, "A", "A result")
+    scan, initial, sent = cm.scan, [], {}
+
+    def scan_then_steer_next(*args):
+        result = scan(*args)
+        if not initial:
+            initial.append(by_thread({"stops": result[1]}).get(sid, {}))
+            hook(sid, "UserPromptSubmit", turn="B", prompt="B")
+            sent.update(send(manager, sid, "steer sent to B"))
+            turn(other, "C", "C result")
+        return result
+
+    with patch.object(cm, "scan", side_effect=scan_then_steer_next):
+        report = local_cli(manager, "listen", "--settle", "0.02", "--poll", "0.02", "--timeout", "1")
+    stops = by_thread(report)
+    a_stop = stops.get(sid, {})
+    still_pending = inbox(sid)
+    delivered = hook(sid, "PostToolUse", turn="B", tool_name="Bash", tool_use_id="tool") or {}
+    context = delivered.get("hookSpecificOutput", {}).get("additionalContext", "")
+    check(initial[0].get("last_message") == "A result" and sent["mode"] == "steer" and sent["turn_id"] == "B"
+          and a_stop.get("last_message") == "A result" and "undelivered" not in a_stop
+          and stops.get(other, {}).get("last_message") == "C result" and still_pending == [sent["id"] + ".json"]
+          and "steer sent to B" in context and not inbox(sid),
+          "R2-7 test_historical_stop_excludes_later_steer: A undelivered=%r, delivered to B=%s"
+          % ([m["preview"] for m in a_stop.get("undelivered", [])], "steer sent to B" in context))
+
+
+def test_clip_tail_previews(case, reply, expected, number):
+    manager, sid = "mgr-preview-" + case, sid_n(number)
+    cli(manager, "claim", "--thread", sid)
+    turn(sid, "reply", reply)
+    listing = by_thread(cli(manager, "list"), "sessions")[sid]
+    status = cli(manager, "status", "--thread", sid)
+    stop = by_thread(listen(manager, *RACE_LISTEN)).get(sid, {})
+    summary_prefix = "Codex 本轮已结束："
+    assert stop["summary"].startswith(summary_prefix)
+    previews = [listing["last_message"], status["codex"]["last_message"], stop["summary"][len(summary_prefix):]]
+    check(previews == [expected] * 3 and stop.get("last_message") == reply
+          and status["unreported"].get("last_message") == reply,
+          "R2-8 test_clip_tail_previews (%s): starts=%r" % (case, [p[:18] for p in previews]))
+
+
+for number, via in enumerate(("exec", "auto"), 73):
+    test_failed_resume_ignores_app_prompt(via, number)
+    test_started_resume_ignores_active_writer_text(via, number + 2)
+for number, reason in enumerate(("error", "stalled"), 77):
+    test_listen_keeps_send_through_approval(reason, number)
+test_ended_acknowledges_earlier_stop()
+test_session_end_keeps_model_failure_streak()
+test_historical_stop_excludes_later_steer()
+test_clip_tail_previews("short-sentence", "甲" * 340 + "。短句。结论。", "…结论。", 83)
+chinese_tail = "下一步。" + "核对结果。" * 17
+test_clip_tail_previews("chinese-closers", "他说：（“" + "甲" * 340 + "。”）" + chinese_tail, "…" + chinese_tail, 84)
+english_tail = "The next step is ready. " + "Do it. " * 11 + "Done."
+test_clip_tail_previews("english-closers", 'He said ("' + "x" * 340 + '.") ' + english_tail, "…" + english_tail, 85)
+
+# summaries of long replies keep the end and never open mid-sentence
+check(cm.clip_tail("短回复。", 200) == "短回复。", "clip_tail keeps a short reply as is")
+check(cm.clip_tail("甲" * 300 + "。" + "结论在这里。" * 10, 200) == "…" + "结论在这里。" * 10,
+      "clip_tail starts a long reply's tail at a sentence boundary")
+check(cm.clip_tail("乙" * 300, 200) == "…" + "乙" * 200, "clip_tail without a boundary keeps the last n chars")
+check(cm.clip_tail("丙" * 300 + "。尾", 200) == "…尾", "clip_tail keeps a short complete tail")
+check(cm.clip_tail("a" * 250 + " v3.13.2 ok", 200).startswith("…a"), "clip_tail: version dots are not sentence ends")
+check(cm.clip_tail("甲" * 340 + '。"下一步。' + "核对结果。" * 17 + '"', 200).startswith('…"下一步。'),
+      "clip_tail keeps an ASCII quote that opens the next sentence after a CJK stop")
+check(cm.clip_tail("据报道：“" + "甲" * 340 + ".”结论。", 200) == "…结论。",
+      "clip_tail: an ASCII stop and closing quote before CJK text end a sentence")
 
 print("\n%d failure(s); tmp=%s" % (len(FAILS), TMP))
 sys.exit(1 if FAILS else 0)

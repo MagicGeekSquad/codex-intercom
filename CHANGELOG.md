@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.1] - 2026-11-19
+
+### Fixed
+
+- `listen` reports the previous turn's reply when a new turn starts during the notification window.
+- `send` records exec resumes that exit nonzero after starting so `listen` can report their outcome.
+- `listen` keeps the send associated with a turn after `error`, `stalled` or `approval` so it can report the recovered turn's reply while later sends wait.
+- Stop summaries and the `list` / `status` previews of long replies show the end of the reply from a sentence boundary instead of starting mid-sentence.
+
 ## [1.1.0] - 2026-11-19
 
 ### Added
@@ -44,5 +53,6 @@ First public release.
 - `list`, `status`, `claim`, `release`, `doctor`, `install`, `uninstall`, `gc`.
 - `install.sh` / `uninstall.sh`, Claude Code plugin marketplace manifest, CI on Linux and macOS.
 
+[1.1.1]: https://github.com/MagicGeekSquad/codex-intercom/releases/tag/v1.1.1
 [1.1.0]: https://github.com/MagicGeekSquad/codex-intercom/releases/tag/v1.1.0
 [1.0.0]: https://github.com/MagicGeekSquad/codex-intercom/releases/tag/v1.0.0

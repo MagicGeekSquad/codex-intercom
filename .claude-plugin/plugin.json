@@ -1,6 +1,6 @@
 {
   "name": "codex-intercom",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Let Claude Code drive Codex sessions: start them, send or steer messages, get woken exactly once when any Codex session stops (with the reason), and get periodic progress check-ins on long Codex tasks — while Claude Code stays idle.",
   "author": {
     "name": "MagicGeekSquad",

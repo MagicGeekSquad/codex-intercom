@@ -3,11 +3,13 @@
   queue ...        -> insert into the fake queue store ($CODEX_QUEUE_DB), print the real message shape
   exec resume ...  -> writer: fail with "active writer"; fail: other error; quiet: exit 0, no turn;
                       run: drain the queue, fire UserPromptSubmit + Stop hooks, exit 0;
-                      crash: drain, fire UserPromptSubmit, exit without a Stop
+                      crash: drain, fire UserPromptSubmit, exit without a Stop;
+                      resume-fast-exit[-with-stop|-writer-text]: fire hooks, then exit on SIGTERM
   exec ...         -> new-* modes: emit startup JSONL and optionally run the first turn
 """
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -63,7 +65,8 @@ if args[:2] == ["exec", "resume"]:
     with open(os.path.join(D, "exec_calls.jsonl"), "a") as f:
         f.write(json.dumps({"args": args, "cwd": os.getcwd(), "prompt": prompt, "mode": mode,
                             "hook_dir": os.environ.get("CODEX_INTERCOM_DIR")}, ensure_ascii=False) + "\n")
-    if mode not in ("resume-race", "resume-stop-only"):
+    fast_exit = mode in ("resume-fast-exit", "resume-fast-exit-with-stop", "resume-fast-exit-writer-text")
+    if not fast_exit and mode not in ("resume-race", "resume-stop-only"):
         time.sleep(1)
     if mode == "writer":
         print("Error: thread/resume: thread/resume failed: thread %s already has an active writer (code -32600)" % tid)
@@ -79,8 +82,17 @@ if args[:2] == ["exec", "resume"]:
 
     if mode == "resume-stop-only":
         hook(tid, "Stop", turn="resume-turn", last_assistant_message="resume without prompt hook")
+        print(json.dumps({"type": "turn.started"}), flush=True)
         sys.exit(0)
     hook(tid, "UserPromptSubmit", prompt=prompt)
+    print(json.dumps({"type": "turn.started"}), flush=True)
+    if fast_exit:
+        if mode == "resume-fast-exit-with-stop":
+            hook(tid, "Stop", last_assistant_message="exec done")
+        if mode == "resume-fast-exit-writer-text":
+            print(json.dumps({"type": "item.completed", "item": {"type": "agent_message",
+                              "text": "The phrase active writer is a documentation term."}}), flush=True)
+        signal.raise_signal(signal.SIGTERM)
     if mode == "resume-race":
         wait_for_finish("finish-resume-race")
     else:

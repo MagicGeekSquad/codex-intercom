@@ -197,6 +197,23 @@ def clip(s, n):
     return s if len(s) <= n else s[:n] + "…"
 
 
+def clip_tail(s, n):
+    """Keep up to n characters from the end, preferring a complete sentence when possible."""
+    s = str(s).strip()
+    if len(s) <= n:
+        return clip(s, n)
+    cutoff = start = len(s) - n
+    # ASCII quotes close an English sentence ('."'), but after a CJK stop they usually open the next one.
+    closers = r"""”’»›)\]}）］｝】〕〉》」』〗〙〛"""
+    boundaries = rf"""(?:[。！？]+[{closers}]*|[.!?]+["'{closers}]*(?=\s|$|[^\x00-\x7f])|\n)\s*"""
+    for match in re.finditer(boundaries, s):
+        if cutoff <= match.end() < len(s):
+            start = match.end()
+            if 4 * (len(s) - start) >= n:
+                break
+    return "…" + clip(s[start:], n)
+
+
 def file_sha(path):
     with open(path, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()
@@ -762,7 +779,7 @@ class Session(object):
         with flocked(self.lock_path):
             yield
 
-    # --- session record: owner, report cursor, sends not started yet, exec run
+    # --- session record: owner, report cursor, outstanding sends, exec run
     def record(self):
         r = read_json(self.rec_path, {}) or {}
         if not isinstance(r.get("expect"), list):
@@ -858,8 +875,21 @@ class Session(object):
             return []
         return sorted(n for n in names if n.endswith(".json"))
 
-    def inbox_messages(self):
-        return [m for m in (read_json(os.path.join(self.inbox, n)) for n in self.pending_names()) if m]
+    def inbox_messages(self, before=None):
+        messages = []
+        for name in self.pending_names():
+            path = os.path.join(self.inbox, name)
+            # put() writes the file after send first creates the message.
+            if before is not None:
+                try:
+                    if os.path.getmtime(path) >= before:
+                        continue
+                except OSError:
+                    continue
+            msg = read_json(path)
+            if msg:
+                messages.append(msg)
+        return messages
 
     def put(self, msg):
         write_json_atomic(os.path.join(self.inbox, msg["id"] + ".json"), msg)
@@ -885,6 +915,43 @@ class Session(object):
 
 # ---------------------------------------------------------------------------- stop detection
 
+def turn_stop(event):
+    return event.get("ev") == "Interrupt" or (event.get("ev") == "Stop" and not event.get("continued"))
+
+
+def turn_stop_info(event, main):
+    info = {"turn_id": event.get("turn"), "t": event["t"], "at": ts_iso(event["t"])}
+    if event["ev"] == "Interrupt":
+        return dict(info, reason="interrupted", summary="Codex 本轮被中断")
+    msg = event.get("msg") or ""
+    info["last_message"] = msg
+    popups = open_questions(main, until=event["t"], kinds=(ASYNC_ASK_TOOL,))
+    if popups:
+        qs = flat_questions(popups)
+        return dict(info, reason="asking", questions=qs,
+                    summary="Codex 本轮结束，App 里有提问弹窗等用户处理：%s"
+                            % clip("；".join(q.get("question", "") for q in qs), 200))
+    return dict(info, reason="done", summary="Codex 本轮已结束：%s" % clip_tail(msg, 200))
+
+
+def model_error_info(failed, events):
+    turn = failed.get("turn")
+    first = failed
+    failures = 0
+    for e in reversed(events):
+        if not turn or e.get("turn") != turn or e.get("ev") != "PostModelRequest":
+            continue
+        if e.get("status") != "failed":
+            break
+        first = e
+        failures += 1
+    failures = failures or 1
+    err = failed.get("error") or "unknown error"
+    return {"reason": "error", "turn_id": turn, "t": first["t"], "at": ts_iso(failed["t"]),
+            "error": err, "failures": failures,
+            "summary": "Codex 模型请求失败后停下（连续 %d 次）：%s" % (failures, clip(err, 200))}
+
+
 def analyze(events, now, cfg=None, after=None, exec_exited=False):
     """State of the latest turn, scoped by its prompt or the exec launch boundary. Returns (stopped, info).
     A stop's info carries `reason` and `t`: a time that stays the same for that stop while nothing
@@ -907,25 +974,10 @@ def analyze(events, now, cfg=None, after=None, exec_exited=False):
         ev = e.get("ev")
         if (ev == "SessionEnd" and prev and prev.get("ev") == "PostModelRequest"
                 and prev.get("status") == "failed"):
-            err = prev.get("error") or "unknown error"  # e.g. `codex exec` exiting after a failed turn
-            return True, {"reason": "error", "turn_id": prev.get("turn"), "t": prev["t"], "at": ts_iso(prev["t"]),
-                          "error": err, "failures": 1, "summary": "Codex 模型请求失败后停下：%s" % clip(err, 200)}
+            return True, model_error_info(prev, main[:main.index(e)])
         prev = e
-        if ev == "Stop" and not e.get("continued"):
-            msg = e.get("msg") or ""
-            info = {"turn_id": e.get("turn"), "t": e["t"], "at": ts_iso(e["t"]), "last_message": msg}
-            popups = open_questions(main, until=e["t"], kinds=(ASYNC_ASK_TOOL,))
-            if popups:
-                qs = flat_questions(popups)
-                info.update(reason="asking", questions=qs,
-                            summary="Codex 本轮结束，App 里有提问弹窗等用户处理：%s"
-                                    % clip("；".join(q.get("question", "") for q in qs), 200))
-            else:
-                info.update(reason="done", summary="Codex 本轮已结束：%s" % clip(msg[-200:], 200))
-            return True, info
-        if ev == "Interrupt":
-            return True, {"reason": "interrupted", "turn_id": e.get("turn"), "t": e["t"], "at": ts_iso(e["t"]),
-                          "summary": "Codex 本轮被中断"}
+        if turn_stop(e):
+            return True, turn_stop_info(e, main)
         if ev == "SessionEnd":
             info = {"reason": "ended", "t": e["t"], "at": ts_iso(e["t"]), "summary": "Codex 会话已结束"}
             if e.get("turn"):
@@ -959,17 +1011,7 @@ def analyze(events, now, cfg=None, after=None, exec_exited=False):
 
     if (lm.get("ev") == "PostModelRequest" and lm.get("status") == "failed"
             and (exec_exited or (model_inflight <= 0 and main_silence >= cfg["error_grace"]))):
-        streak = []
-        for e in reversed([x for x in tm if x.get("ev") == "PostModelRequest"]):
-            if e.get("status") != "failed":
-                break
-            streak.append(e)
-        first = streak[-1] if streak else lm  # retries keep failing: still the same stop
-        err = lm.get("error") or "unknown error"
-        failures = len(streak) or 1
-        return True, {"reason": "error", "turn_id": turn, "t": first["t"], "at": ts_iso(lm["t"]), "error": err,
-                      "failures": failures,
-                      "summary": "Codex 模型请求失败后停下（连续 %d 次）：%s" % (failures, clip(err, 200))}
+        return True, model_error_info(lm, tm)
 
     perms = [e for e in seg_main if e.get("ev") == "PermissionRequest"]
     if perms and main_silence >= cfg["approval_grace"]:
@@ -1000,8 +1042,7 @@ def analyze(events, now, cfg=None, after=None, exec_exited=False):
 
 def stops_between(main, lo, hi):
     """Turn ends (Stop / Interrupt) strictly between two times: stops nobody was told about."""
-    return sum(1 for e in main if lo < e["t"] < hi
-               and ((e.get("ev") == "Stop" and not e.get("continued")) or e.get("ev") == "Interrupt"))
+    return sum(1 for e in main if lo < e["t"] < hi and turn_stop(e))
 
 
 def exec_completion_hint(path):
@@ -1023,8 +1064,7 @@ def exec_completion_hint(path):
 
 
 def terminal_hook(event):
-    return event.get("ev") in ("Interrupt", "SessionEnd") or (
-        event.get("ev") == "Stop" and not event.get("continued"))
+    return turn_stop(event) or event.get("ev") == "SessionEnd"
 
 
 def exec_end(ex, recent, prompt):
@@ -1049,15 +1089,15 @@ def exec_end(ex, recent, prompt):
 def current(rec, read_events, now, cfg):
     """Analyze the latest turn from a snapshot taken after any observed exec exit."""
     events = read_events()
-    ex = rec.get("exec")
-    reported_end = (ex or {}).get("reported_end")
-    exited = bool(reported_end)
+    ex = rec.get("exec") or {}
+    reported_end = ex.get("reported_end")
+    exited = bool(reported_end) or ex.get("returncode") is not None
     if not exited and ex and ex.get("pid") and not exec_alive(ex["pid"]):
         # Stop and UserPromptSubmit are synchronous: an exiting process may have just written them.
         events = read_events()
         exited = True
     main = [e for e in events if not e.get("sub")]
-    launch = (ex or {}).get("started")
+    launch = ex.get("started")
     recent = [e for e in main if e["t"] > launch] if launch is not None else []
     latest_prompt = next((e for e in reversed(recent) if e.get("ev") == "UserPromptSubmit"), None)
     # A Stop can be the only evidence of the exec turn, even before its process exits.
@@ -1122,13 +1162,23 @@ def assess(box, rec, read_events, now, cfg, queue):
             waiting.append(x)
 
     reported = rec.get("reported") or 0
+    candidate = info if stopped else None
+    last_stop = None
+    if not stopped:
+        # A new prompt changes the current state without acknowledging the previous turn's stop.
+        last_stop = next((e for e in reversed(main) if e["t"] > reported and turn_stop(e)), None)
+        if last_stop is not None:
+            candidate = turn_stop_info(last_stop, main)
     att = None
     # A later queued send cannot be answered by an old stop. A stop tied to an earlier send
     # of ours can still be reported in its own right while the later send waits.
-    if stopped and info is not end and (t := info.get("t")) is not None and t > reported:
+    if candidate is not None and candidate is not end and (t := candidate.get("t")) is not None and t > reported:
         covered = [(x, start) for x, start in started if start["t"] <= t]
-        if not waiting or any(start.get("turn") == info.get("turn_id") for _, start in covered):
-            att = dict(info, _cursor=t, _drop=[x["id"] for x, _ in covered])
+        if not waiting or any(start.get("turn") == candidate.get("turn_id") for _, start in covered):
+            att = dict(candidate, _cursor=t)
+            # A stop without a terminal hook can still resume and write its final result.
+            if any(e["t"] == t and e.get("turn") == candidate.get("turn_id") and terminal_hook(e) for e in main):
+                att["_drop"] = [x["id"] for x, _ in covered]
             if state["exec_terminal"] and state["exec_terminal"]["t"] == t:
                 att["_exec_update"] = (ex, {"terminal_reported": True})
             n = stops_between(main, reported, t)
@@ -1136,6 +1186,14 @@ def assess(box, rec, read_events, now, cfg, queue):
                 att["earlier_stops"] = n
     if att is None and info is end and end and end["reason"] == "ended" and not ex.get("reported_end"):
         att = dict(end, _exec_update=(ex, {"reported_end": end}))
+        start_t = state["exec_start"]["t"]
+        earlier = [e for e in main if reported < e["t"] < start_t and turn_stop(e)]
+        if earlier:
+            # Acknowledge the older stops while leaving this exec's late Stop reportable.
+            cursor = earlier[-1]["t"]
+            turns = {e["turn"] for e in earlier if e.get("turn")}
+            att.update(earlier_stops=len(earlier), _cursor=cursor,
+                       _drop=[x["id"] for x, start in started if start["t"] <= cursor and start.get("turn") in turns])
     if att is None and waiting:
         expired = [x for x in waiting if now - x["t"] >= cfg["start_timeout"]]
         if end and end["reason"] == "not_started" and exec_send in waiting and not ex.get("reported_end"):
@@ -1157,7 +1215,8 @@ def assess(box, rec, read_events, now, cfg, queue):
             if blocked:
                 att["blocked_by_question"] = flat_questions(blocked)
     if att is not None:
-        undelivered = box.inbox_messages()
+        before = last_stop["t"] if last_stop and att.get("_cursor") == last_stop["t"] else None
+        undelivered = box.inbox_messages(before=before)
         if undelivered:
             att["undelivered"] = [{"id": m["id"], "preview": clip(m.get("text", ""), 80)} for m in undelivered]
     return dict(state, waiting=waiting, started=[x for x, _ in started], attention=att, queue=queue)
@@ -1533,6 +1592,24 @@ def resolve_exec_settings(box, requested):
     return resolved
 
 
+def exec_turn_started(output, exited):
+    """Look for a turn event in new JSONL from this exec process."""
+    while True:
+        offset = output.tell()
+        raw = output.readline()
+        if not raw:
+            return False
+        if not exited and not raw.endswith(b"\n"):
+            output.seek(offset)
+            return False
+        try:
+            event = json.loads(raw)
+        except (ValueError, UnicodeError):
+            continue
+        if isinstance(event, dict) and event.get("type") in ("turn.started", "turn.completed"):
+            return True
+
+
 def start_exec(box, codex, prompt, settings, watch_s=15.0):
     """Run `codex exec resume <sid> <prompt>` detached, in the session's working directory. Returns
     once it is clearly running (or failed). The App holding the session shows up as active_writer."""
@@ -1549,27 +1626,32 @@ def start_exec(box, codex, prompt, settings, watch_s=15.0):
             os.remove(old)
         except OSError:
             pass
-    log = os.path.join(box.root, "exec-%s.log" % datetime.now().strftime("%Y%m%d-%H%M%S"))
+    log = os.path.join(box.root, "exec-%s-%s.log" % (datetime.now().strftime("%Y%m%d-%H%M%S"), uuid.uuid4().hex))
     t_spawn = time.time()
-    with open(log, "wb") as lf:
+    deadline = time.monotonic() + watch_s
+    with open(log, "xb") as lf:
         p = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=lf, stderr=subprocess.STDOUT,
                              start_new_session=True, env=dict(os.environ, CODEX_INTERCOM_DIR=box.base))
     running = {"ok": True, "exec_pid": p.pid, "exec_log": tilde(log), "cwd": cwd, "exec_settings": resolved,
                "_log": log, "_started": t_spawn}
-    while time.time() - t_spawn < watch_s:
-        rc = p.poll()
-        if rc is not None:
-            with open(log, encoding="utf-8", errors="replace") as f:
-                tail = f.read()[-4000:]
-            if "active writer" in tail:
-                return {"ok": False, "active_writer": True, "exec_log": tilde(log)}
-            if rc == 0:
+    with open(log, "rb") as output:
+        while True:
+            rc = p.poll()
+            if exec_turn_started(output, exited=rc is not None):
+                rc = p.poll() if rc is None else rc
+                return dict(running, _returncode=rc) if rc is not None else running
+            if rc is not None:
+                output.seek(0)
+                tail = output.read().decode("utf-8", errors="replace")[-4000:]
+                if "active writer" in tail:
+                    return {"ok": False, "active_writer": True, "exec_log": tilde(log)}
+                if rc == 0:
+                    return dict(running, _returncode=rc)
+                return {"ok": False, "error": clip(tail[-400:], 400), "exec_log": tilde(log)}
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 return running
-            return {"ok": False, "error": clip(tail[-400:], 400), "exec_log": tilde(log)}
-        if any(e.get("ev") == "UserPromptSubmit" and e["t"] > t_spawn for e in box.events()):
-            break
-        time.sleep(0.5)
-    return running
+            time.sleep(min(0.5, remaining))
 
 
 def expect_set(box, xid, **kw):
@@ -1592,7 +1674,10 @@ def expect_drop(box, xid):
 def record_exec(box, r, send_id=None):
     """Publish the exec run and its send together, so listen can attribute its hooks."""
     def fn(rec):
-        rec["exec"] = {"pid": r["exec_pid"], "started": r["_started"], "log": r["_log"], "send_id": send_id}
+        run = {"pid": r["exec_pid"], "started": r["_started"], "log": r["_log"], "send_id": send_id}
+        if "_returncode" in r:
+            run["returncode"] = r["_returncode"]
+        rec["exec"] = run
         for expect in rec["expect"]:
             if expect["id"] == send_id:
                 expect.pop("queuing", None)
@@ -1998,7 +2083,7 @@ def cmd_list(args):
         if a["waiting"]:
             row["pending_sends"] = len(a["waiting"])
         if info.get("last_message"):
-            row["last_message"] = clip(info["last_message"][-400:], 160)
+            row["last_message"] = clip_tail(info["last_message"], 160)
         rows.append(row)
     print(json.dumps({"manager": mgr.id, "listening": bool(mgr.listener()), "sessions": rows},
                      ensure_ascii=False, indent=2))
@@ -2018,7 +2103,7 @@ def cmd_status(args):
     info = dict(a["info"], stopped=a["stopped"])
     info.pop("t", None)
     if info.get("last_message"):
-        info["last_message"] = clip(info["last_message"][-600:], 300)
+        info["last_message"] = clip_tail(info["last_message"], 300)
     owner = rec.get("manager")
     om = Manager(base, owner) if owner else None
     od = om.data() if om else {}
