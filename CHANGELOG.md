@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [1.2.0] - 2026-11-20
+
+### Fixed
+
+- `send` steers a live recorded exec through its main-thread hooks. A writer conflict reports the state of the original Codex queue item.
+- `listen` and `status` distinguish the main turn from a live exec and show recent subagent activity. Exit reports identify undelivered steers.
+- Exec liveness checks the process start identity. The watcher distinguishes an unknown identity, a start timeout, and a confirmed exit.
+- Serialize sends per session without blocking hooks on the send lock. Keep steers after failed hook output and report confirmed output separately from consumption.
+
 ## [1.1.1] - 2026-11-19
 
 ### Fixed
@@ -53,6 +64,7 @@ First public release.
 - `list`, `status`, `claim`, `release`, `doctor`, `install`, `uninstall`, `gc`.
 - `install.sh` / `uninstall.sh`, Claude Code plugin marketplace manifest, CI on Linux and macOS.
 
+[1.2.0]: https://github.com/MagicGeekSquad/codex-intercom/releases/tag/v1.2.0
 [1.1.1]: https://github.com/MagicGeekSquad/codex-intercom/releases/tag/v1.1.1
 [1.1.0]: https://github.com/MagicGeekSquad/codex-intercom/releases/tag/v1.1.0
 [1.0.0]: https://github.com/MagicGeekSquad/codex-intercom/releases/tag/v1.0.0

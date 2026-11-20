@@ -7,6 +7,7 @@ usage: python3 tests/test_intercom.py [path/to/codex_intercom.py]
        (default: skills/codex-intercom/scripts/codex_intercom.py in this repo)
 """
 import contextlib
+import errno
 import importlib.util
 import io
 import json
@@ -337,8 +338,9 @@ quiet_run = dict(ex, reported_end=end)
 app_turn = [E(5, "Stop"), E(20, "UserPromptSubmit", turn="app")]
 check(cm.current({"exec": quiet_run}, lambda: app_turn, 21, cm.DEFAULT_CFG)["info"]["reason"] == "working",
       "A2 a reported before-start exit does not stop the next App turn")
-check(cm.current({"exec": dict(ex, pid=os.getpid())}, lambda: mid, 13, cm.DEFAULT_CFG)["exec_end"] is None,
-      "A2 exec still running -> nothing")
+with patch.object(cm, "exec_alive", return_value=True):
+    check(cm.current({"exec": dict(ex, pid=os.getpid())}, lambda: mid, 13, cm.DEFAULT_CFG)["exec_end"] is None,
+          "A2 exec still running -> nothing")
 
 # ================================================================== A3. progress snapshot from the rollout
 RS = sid_n(98)
@@ -721,7 +723,8 @@ with open(exec_calls) as f:
 time.sleep(1.5)
 set_mode("writer")
 r = send("mgr-e1", S, "app holds it but is busy")
-check(r["transport"] == "app" and "note" in r, "E auto: exec sees active writer -> stays with the App")
+check(r["transport"] == "exec_busy" and r.get("active_writer") and queued(S) == 1,
+      "E auto: active writer identifies a conflict and accounts for the original queue item")
 S = sid_n(31)
 hook(S, "UserPromptSubmit", prompt="setup")
 hook(S, "Stop", last_assistant_message="ok")
@@ -749,7 +752,7 @@ hook(S, "Stop", turn="app2", last_assistant_message="app2 done")
 set_mode("writer")
 r = send("mgr-e2", S, "direct", "--via", "exec")
 check(r["_rc"] == 1 and r.get("active_writer") and record(S)["expect"] == [],
-      "E --via exec with the App holding the session -> error, nothing pending")
+      "E --via exec with an existing writer -> error, nothing pending")
 set_mode("fail")
 r = send("mgr-e2", S, "broken exec", "--model", "queued-model", "--effort", "medium")
 check(r.get("ok") is True and r.get("transport") == "queued" and r.get("exec_error"),
@@ -1032,10 +1035,12 @@ with capture_exec_children() as children:
     expiry = real_stop["t"] - before + 0.025
     time.sleep(max(0, before + expiry - time.time()))
     st = cli(MR, "status", "--thread", SR)
-    first = by_thread(listen(MR, "--settle", "0", "--start-timeout", str(expiry), "--timeout", "0.5")).get(SR, {})
+    report = listen(MR, "--settle", "0", "--start-timeout", str(expiry), "--timeout", "0.5")
+    first = by_thread(report).get(SR, {})
     after = race_box.record()["reported"]
     check(st["codex"]["reason"] == "done" and st["exec"]["alive"] and children[0].poll() is None
-          and first.get("reason") == "done" and first.get("last_message") == "第一轮已完成" and after == real_stop["t"],
+          and first.get("reason") == "done" and first.get("last_message") == "第一轮已完成" and after == real_stop["t"]
+          and not report["watching"],
           "E5 review 1: live exec's real Stop wins at the start deadline (listen: %s, cursor past Stop: %s)"
           % (first.get("reason"), after > real_stop["t"]))
     open(os.path.join(TMP, "finish-new-stop-only-wait"), "w").close()
@@ -1050,9 +1055,12 @@ os.remove(finish_new)
 with capture_exec_children() as children:
     r = local_cli(MR, "new", "--codex", FAKE, "--message", "run first")
     SR = r["thread"]
-    sent = send(MR, SR, "wait in the App queue", "--queue", "--via", "app")
     race_box = cm.Session(BOX, SR)
-    next_send = next(x for x in race_box.record()["expect"] if x["id"] == sent["id"])
+    # A prior version could put a message in the App queue while this exec was alive.
+    rc, _, qid = cm.run_codex_queue(FAKE, SR, "wait in the App queue")
+    assert rc == 0 and qid
+    next_send = {"id": "legacy-send", "t": time.time(), "qid": qid, "transport": "app"}
+    race_box.edit_record(lambda rec: rec["expect"].append(next_send))
     open(finish_new, "w").close()
     assert children[0].wait(timeout=5) == 0
 st = cli(MR, "status", "--thread", SR)
@@ -1066,7 +1074,7 @@ check(st["codex"]["reason"] == "done" and queued(SR) == 1 and first.get("reason"
 expiry = real_stop["t"] - next_send["t"] + 0.025
 r = listen(MR, "--settle", "0", "--start-timeout", str(expiry), "--timeout", "0.7")
 second = by_thread(r).get(SR, {})
-check(second.get("reason") == "not_started" and [x["id"] for x in second["queued"]] == [sent["id"]]
+check(second.get("reason") == "not_started" and [x["id"] for x in second["queued"]] == [next_send["id"]]
       and race_box.record()["reported"] == real_stop["t"],
       "E5 review 2: only the queued send times out and the hook cursor stays on the first Stop")
 r = listen(MR, "--settle", "0", "--start-timeout", str(expiry), "--timeout", "0.3")
@@ -1112,7 +1120,9 @@ check(first.get("reason") == "ended" and st["codex"]["reason"] == "ended" and no
       "E5 review 4: one exec exit never becomes working or stalled (status: %s, next stop: %s)"
       % (st["codex"]["reason"], by_thread(r).get(SR, {}).get("reason")))
 hook(SR, "SessionEnd", turn="exec-turn")  # older hook registrations can still write this event
-check(listen(MR, "--settle", "0", "--stall", "0", "--timeout", "0.3")["reason"] == "timeout",
+st = cli(MR, "status", "--thread", SR)
+check(st["codex"]["reason"] == "ended" and st["codex"]["stopped"] and not st["unreported"]
+      and listen(MR, "--settle", "0", "--stall", "0", "--timeout", "0.3")["reason"] == "timeout",
       "E5 review 4: a legacy SessionEnd cannot repeat the reported exit")
 hook(SR, "Stop", turn="exec-turn", last_assistant_message="late Stop after ended")
 late = by_thread(listen(MR, "--settle", "0", "--timeout", "0.5")).get(SR, {})
@@ -1603,6 +1613,439 @@ check(cm.clip_tail("甲" * 340 + '。"下一步。' + "核对结果。" * 17 + '
       "clip_tail keeps an ASCII quote that opens the next sentence after a CJK stop")
 check(cm.clip_tail("据报道：“" + "甲" * 340 + ".”结论。", 200) == "…结论。",
       "clip_tail: an ASCII stop and closing quote before CJK text end a sentence")
+
+# ================================================================== J. steering to a live exec
+BUSY_LISTEN = RACE_LISTEN + ("--error-grace", "0")
+
+
+def exec_calls(sid):
+    path = os.path.join(TMP, "exec_calls.jsonl")
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        return [call for line in f if (call := json.loads(line))["args"][-2] == sid]
+
+
+def test_busy_exec_steer(ending):
+    manager = "mgr-busy-steer-" + ending
+    text = "插话只送达一次"
+    set_mode("new-busy")
+    with capture_exec_children() as children:
+        new = local_cli(manager, "new", "--codex", FAKE, "--message", "first")
+        sid = new["thread"]
+        box = cm.Session(BOX, sid)
+        deadline = time.monotonic() + 5
+        while not os.path.exists(os.path.join(TMP, "failed-" + sid)):
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+        out = listen(manager, *BUSY_LISTEN)
+        error = by_thread(out).get(sid, {})
+        check(error.get("reason") == "error" and error.get("exec_alive")
+              and error.get("subagent_activity", {}).get("agent") == "worker"
+              and by_thread(out, "watching").get(sid, {}).get("state") == "exec_busy",
+              "J main error and live subagent activity are both observable")
+        if ending == "recover":
+            assert cli(manager, "release", "--thread", sid)["released"]
+        sent = send(manager, sid, text, "--queue", "--via", "exec") if ending == "recover" else send(manager, sid, text)
+        status = cli(manager, "status", "--thread", sid, "--error-grace", "0")
+        check(sent["ok"] and sent.get("mode") == "steer" and sent.get("transport") == "exec_busy"
+              and sent.get("exec_alive") and "子代理" in sent.get("note", "")
+              and [x["id"] for x in status["inbox"]] == [sent["id"]] and not status["pending_sends"]
+              and not queued(sid) and not exec_calls(sid),
+              "J live exec uses the existing inbox without Codex queue or competing resume")
+        check(status["exec"]["alive"] and box.record()["exec"].get("process_start") and status["codex"].get("reason") == "error"
+              and status["codex"].get("main_stopped") and not status["codex"]["stopped"]
+              and status["state"]["status"] == "exec_busy",
+              "J status distinguishes the failed main request from the live process")
+        if ending == "recover":
+            hook(sid, "PermissionRequest", turn="exec-turn", tool_name="Bash")
+            approval = by_thread(listen(manager, *BUSY_LISTEN, "--approval-grace", "0")).get(sid, {})
+            check(approval.get("reason") == "approval" and approval.get("exec_alive") and inbox(sid),
+                  "J an inbox message sent after claiming mid-turn does not hide approval")
+            open(os.path.join(TMP, "recover-" + sid), "w").close()
+        open(os.path.join(TMP, "finish-" + sid), "w").close()
+        assert children[0].wait(timeout=5) == 0
+    if ending == "recover":
+        with open(os.path.join(TMP, "recovered-" + sid)) as f:
+            first, second = json.load(f)
+        done = by_thread(listen(manager, *BUSY_LISTEN)).get(sid, {})
+        check(first and first["hookSpecificOutput"]["additionalContext"].count(text) == 1 and second is None
+              and not inbox(sid) and done.get("last_message") == "main recovered" and done.get("exec_exit")
+              and not exec_calls(sid) and not queued(sid),
+              "J recovered main hook delivers the original body once and preserves the real Stop")
+        return
+    if ending == "listen":
+        exited = by_thread(listen(manager, *BUSY_LISTEN)).get(sid, {})
+        check(exited.get("reason") == "ended" and exited.get("exec_exit")
+              and [x["id"] for x in exited.get("undelivered", [])] == [sent["id"]]
+              and "下一条" in exited.get("undelivered_note", "") and inbox(sid),
+              "J exit reports the undelivered steer and explains carry-forward")
+        check(listen(manager, *BUSY_LISTEN)["reason"] == "timeout" and not exec_calls(sid),
+              "J listen does not start a new turn after the old exec exits")
+    set_mode("run")
+    next_send = send(manager, sid, "下一轮的新指示", "--via", "exec")
+    done = by_thread(listen(manager, *BUSY_LISTEN, "--timeout", "5")).get(sid, {})
+    receipt = box.receipt(sent["id"]) or {}
+    injection = os.path.join(TMP, "resume-injected-" + sid)
+    injected = ""
+    if os.path.exists(injection):
+        with open(injection) as f:
+            injected = json.load(f)["hookSpecificOutput"]["additionalContext"]
+    check(next_send.get("transport") == "exec" and injected.count(text) == 1
+          and receipt.get("delivered_via") == "UserPromptSubmit" and not inbox(sid)
+          and [call["prompt"] for call in exec_calls(sid)] == ["下一轮的新指示"]
+          and done.get("reason") == "done",
+          "J the next explicit send carries the original steer once at the prompt hook")
+    if ending == "send":
+        previous = next_send.get("previous_exec_exit", {})
+        check(previous.get("exec_exit") and previous.get("exec_log") == new["exec_log"]
+              and [x["id"] for x in previous.get("undelivered", [])] == [sent["id"]],
+              "J a new exec send reports the earlier exit before replacing its record")
+
+
+def test_unknown_writer():
+    manager, sid = "mgr-unknown-writer", sid_n(86)
+    turn(sid, "old", "last result")
+    set_mode("writer")
+    direct = send(manager, sid, "direct", "--via", "exec")
+    check(not direct["ok"] and direct.get("active_writer") and direct.get("transport") == "exec_busy"
+          and not queued(sid) and not record(sid)["expect"],
+          "J direct exec identifies a writer conflict before any queue entry")
+    sent = send(manager, sid, "queue once", "--app-timeout", "0")
+    check(sent["ok"] and sent.get("transport") == "exec_busy" and sent.get("active_writer")
+          and sent.get("queue_id") and sent.get("exec_log") and queued(sid) == 1 and "--via exec" in sent["note"],
+          "J an untracked conflict reports the actual queue item and how to handle it")
+    set_mode("run")
+    report = by_thread(listen(manager, *BUSY_LISTEN, "--start-timeout", "0")).get(sid, {})
+    status = cli(manager, "status", "--thread", sid)
+    check(report.get("reason") == "not_started" and report.get("codex_queue") == 1
+          and report.get("queue_note") and len(exec_calls(sid)) == 2 and queued(sid) == 1
+          and status.get("queue_conflicts") == [{"id": sent["id"], "queue_id": sent.get("queue_id"), "in_codex_queue": True}],
+          "J listen explains the conflict without attempting an automatic retry")
+    app_take(sid)
+    turn(sid, "app", "App result")
+    done = by_thread(listen(manager, *BUSY_LISTEN)).get(sid, {})
+    check(done.get("last_message") == "App result" and len(exec_calls(sid)) == 2,
+          "J real prompt and stop hooks can still confirm delivery of the original queue item")
+
+
+def test_exec_process_identity():
+    manager, sid = "mgr-process-identity", sid_n(87)
+    cli(manager, "claim", "--thread", sid)
+    turn(sid, "old", "old reply")
+    box = cm.Session(BOX, sid)
+    started = time.time()
+    child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE)
+    try:
+        box.edit_record(lambda rec: rec.update(exec={"pid": child.pid, "started": started,
+                                                    "process_start": cm.process_start_token(child.pid)}))
+        status = cli(manager, "status", "--thread", sid)
+        check(status["exec"]["alive"] and status["codex"]["reason"] == "starting"
+              and not status["codex"]["stopped"] and not status["codex"].get("turn_id")
+              and status["state"]["status"] == "starting",
+              "J a live new exec with no hooks does not inherit the previous Stop")
+        turn(sid, "first-managed", "first result")
+        hook(sid, "UserPromptSubmit", turn="later", prompt="another turn")
+        current = cli(manager, "status", "--thread", sid)["codex"]
+        check(current.get("reason") == "working" and current.get("turn_id") == "later",
+              "J new main hooks after launch take precedence over an earlier Stop")
+        box.edit_record(lambda rec: rec["exec"].update(process_start="previous process"))
+        reused = cli(manager, "status", "--thread", sid)
+        check(reused["exec"]["alive"] is False and child.poll() is None,
+              "J a reused PID is rejected when its process identity no longer matches")
+        box.edit_record(lambda rec: rec.update(exec={"pid": child.pid, "started": started - 10}))
+        legacy = cli(manager, "status", "--thread", sid)
+        check(legacy["exec"]["alive"] is None and child.poll() is None,
+              "J a legacy record leaves a live PID unverified")
+    finally:
+        child.communicate(timeout=5)
+
+
+def test_old_queue_exit_note():
+    box = cm.Session(BOX, sid_n(88))
+    rec = {"exec": {"started": 1, "returncode": 0}, "reported": 3,
+           "expect": [{"id": "old", "t": 2.5, "qid": "old-qid", "transport": "app", "not_started_reported": True}]}
+    events = [E(2, "UserPromptSubmit"), E(3, "Stop")]
+    unknown = cm.assess(box, rec, lambda: events, 4, cm.DEFAULT_CFG, None)["attention"] or {}
+    known = cm.assess(box, rec, lambda: events, 4, cm.DEFAULT_CFG, {"old-qid": box.sid})["attention"] or {}
+    check(unknown.get("exec_exit") and unknown.get("codex_queue", -1) is None and "status" in unknown.get("queue_note", "")
+          and known.get("exec_exit") and known.get("codex_queue") == 1 and "--via exec" in known.get("queue_note", ""),
+          "J exit guides the manager when an earlier queue item is present or temporarily unreadable")
+
+
+for ending in ("recover", "listen", "send"):
+    test_busy_exec_steer(ending)
+test_unknown_writer()
+test_exec_process_identity()
+test_old_queue_exit_note()
+
+# ================================================================== K. independent review of exec transport and notices
+def test_concurrent_new_turn_sends():
+    manager, sid = "mgr-serial-send", sid_n(90)
+    turn(sid, "setup", "idle")
+    set_mode("resume-race")
+    finish = os.path.join(TMP, "finish-resume-race")
+    if os.path.exists(finish):
+        os.remove(finish)
+    open(os.path.join(TMP, "pause-queue-" + sid), "w").close()
+    first, a = bg(send, manager, sid, "A", "--app-timeout", "0")
+    deadline = time.monotonic() + 5
+    while not os.path.exists(os.path.join(TMP, "in-queue-" + sid)):
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+    second, b = bg(send, manager, sid, "B", "--via", "exec")
+    try:
+        second.join(1)
+        competing = bool(exec_calls(sid))
+        if competing:
+            open(os.path.join(TMP, "writer-" + sid), "w").close()
+        open(os.path.join(TMP, "finish-queue-" + sid), "w").close()
+        first.join(5)
+        second.join(5)
+        check(not competing and a.get("transport") == "exec" and b.get("mode") == "steer"
+              and b.get("transport") == "exec_busy" and not queued(sid)
+              and len(exec_calls(sid)) == 1 and inbox(sid) == [b.get("id", "") + ".json"],
+              "K1 concurrent sends serialize through launch and attach B to A's live exec")
+    finally:
+        open(os.path.join(TMP, "finish-queue-" + sid), "w").close()
+        open(finish, "w").close()
+        first.join(5)
+        second.join(5)
+    listen(manager, *BUSY_LISTEN)
+    set_mode("run")
+
+
+def test_broken_hook_output():
+    manager = "mgr-broken-output"
+    set_mode("new-race-started")
+    with capture_exec_children() as children:
+        new = local_cli(manager, "new", "--codex", FAKE, "--message", "first")
+        sid = new["thread"]
+        box = cm.Session(BOX, sid)
+        sent = send(manager, sid, "正文必须保留")
+        reader, writer = os.pipe()
+        os.close(reader)
+        try:
+            subprocess.run([sys.executable, MB, "--dir", BOX, "hook"],
+                           input=json.dumps({"session_id": sid, "hook_event_name": "Stop",
+                                             "turn_id": "exec-turn", "last_assistant_message": "last reply"}),
+                           text=True, stdout=writer, stderr=subprocess.PIPE, timeout=5)
+        finally:
+            os.close(writer)
+        stop = box.events()[-1]
+        check(box.receipt(sent["id"]) is None and inbox(sid) == [sent["id"] + ".json"] and not stop.get("continued"),
+              "K2 a broken Stop pipe keeps the original body eligible and records no continuation")
+        children[0].terminate()
+        children[0].wait(timeout=5)
+    exited = by_thread(listen(manager, *BUSY_LISTEN)).get(sid, {})
+    check(exited.get("exec_exit") and [m["id"] for m in exited.get("undelivered", [])] == [sent["id"]],
+          "K2 a failed output remains visible on the exec exit report")
+    set_mode("run")
+    send(manager, sid, "next", "--via", "exec")
+    listen(manager, *BUSY_LISTEN, "--timeout", "5")
+    receipt = box.receipt(sent["id"]) or {}
+    st = cli(manager, "status", "--thread", sid)
+    check(receipt.get("delivered_via") == "UserPromptSubmit" and receipt.get("hook_output") == "written"
+          and receipt.get("delivery_status") == "unknown" and not inbox(sid)
+          and any(m["id"] == sent["id"] and m.get("delivery_status") == "unknown" for m in st["recent_delivered"]),
+          "K2 next explicit send publishes the body and distinguishes output from consumption")
+
+
+def test_uncertain_hook_receipt():
+    manager, sid = "mgr-uncertain-hook", sid_n(96)
+    hook(sid, "UserPromptSubmit", prompt="first")
+    sent = send(manager, sid, "output may have been consumed")
+    box = cm.Session(BOX, sid)
+    write = cm.write_json_atomic
+
+    def fail_commit(path, value, *args, **kwargs):
+        if path == os.path.join(box.delivered, sent["id"] + ".json") and value.get("hook_output") == "written":
+            raise OSError(errno.EIO, "receipt update failed")
+        return write(path, value, *args, **kwargs)
+
+    with patch.object(cm, "write_json_atomic", side_effect=fail_commit), contextlib.redirect_stdout(io.StringIO()) as out:
+        cm.handle_hook(BOX, {"session_id": sid, "hook_event_name": "PostToolUse", "turn_id": "t1"})
+    st = cli(manager, "status", "--thread", sid)
+    check("output may have been consumed" in out.getvalue() and not st["inbox"]
+          and st["recent_delivered"][0].get("hook_output") == "unknown" and not hook(sid, "PostToolUse"),
+          "K2 a failed receipt update after output preserves uncertainty without a duplicate handoff")
+
+
+def test_exit_after_start_timeout():
+    manager = "mgr-exit-after-timeout"
+    set_mode("new-race-empty")
+    with capture_exec_children() as children:
+        new = local_cli(manager, "new", "--codex", FAKE, "--message", "first")
+        sid = new["thread"]
+        sent = send(manager, sid, "before first hook")
+        timeout = by_thread(listen(manager, *BUSY_LISTEN, "--start-timeout", "0")).get(sid, {})
+        children[0].terminate()
+        children[0].wait(timeout=5)
+    exited = by_thread(listen(manager, *BUSY_LISTEN, "--start-timeout", "0")).get(sid, {})
+    again = listen(manager, *BUSY_LISTEN, "--start-timeout", "0")
+    check(timeout.get("reason") == "not_started" and not timeout.get("exec_exit") and exited.get("exec_exit")
+          and [m["id"] for m in exited.get("undelivered", [])] == [sent["id"]]
+          and again["reason"] == "timeout" and not again["stops"] and inbox(sid),
+          "K3 start timeout and actual before-hook exit are reported independently once")
+    set_mode("run")
+
+
+def test_app_steer_after_exec():
+    manager = "mgr-app-after-exec"
+    set_mode("new-finished")
+    new = cli(manager, "new", "--codex", FAKE, "--message", "first")
+    sid = new["thread"]
+    assert by_thread(listen(manager, *BUSY_LISTEN))[sid]["reason"] == "done"
+    hook(sid, "UserPromptSubmit", turn="app-turn", prompt="new App round")
+    sent = send(manager, sid, "for App")
+    report = listen(manager, *BUSY_LISTEN)
+    received = hook(sid, "PostToolUse", turn="app-turn", tool_name="Bash")
+    check(sent.get("turn_id") == "app-turn" and report["reason"] == "timeout" and not report["stops"]
+          and by_thread(report, "watching").get(sid, {}).get("state") == "working"
+          and received and "for App" in json.dumps(received),
+          "K4 a later App steer does not generate an exit for the old exec")
+    set_mode("run")
+
+
+def test_session_end_stays_terminal():
+    manager = "mgr-exec-session-end"
+    set_mode("new-race-started")
+    with capture_exec_children() as children:
+        new = local_cli(manager, "new", "--codex", FAKE, "--message", "first")
+        sid = new["thread"]
+        sent = send(manager, sid, "before SessionEnd")
+        hook(sid, "SessionEnd", turn="exec-turn")
+        children[0].terminate()
+        children[0].wait(timeout=5)
+    stop = by_thread(listen(manager, *BUSY_LISTEN)).get(sid, {})
+    st = cli(manager, "status", "--thread", sid)
+    row = cli(manager, "list")["sessions"][0]
+    again = listen(manager, *BUSY_LISTEN)
+    check(stop.get("exec_exit") and [m["id"] for m in stop.get("undelivered", [])] == [sent["id"]]
+          and st["exec"]["alive"] is False and st["codex"]["stopped"] is True and st["state"]["status"] == "idle"
+          and row["state"] == "stopped" and again["reason"] == "timeout" and not again["watching"],
+          "K5 a reported SessionEnd still supplies terminal state to all views")
+    set_mode("run")
+
+
+def test_process_visibility(hidden, number):
+    manager, sid = "mgr-process-visibility-" + str(hidden), sid_n(number)
+    cli(manager, "claim", "--thread", sid)
+    started = time.time()
+    child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE)
+    box = cm.Session(BOX, sid)
+    try:
+        box.edit_record(lambda rec: rec.update(exec={"started": started, "pid": child.pid,
+                                                   "process_start": cm.process_start_token(child.pid)}))
+        hook(sid, "UserPromptSubmit", prompt="first")
+        hook(sid, "PostModelRequest", status="failed", error="Selected model is at capacity")
+        open_file = open
+
+        def hidden_proc(path, *args, **kwargs):
+            if path == "/proc/%d/stat" % child.pid:
+                raise FileNotFoundError(errno.ENOENT, "hidden procfs entry")
+            return open_file(path, *args, **kwargs)
+
+        fault = (contextlib.ExitStack() if hidden else
+                 patch.object(cm, "process_start", side_effect=PermissionError(errno.EACCES, "temporarily denied")))
+        with fault as stack:
+            if hidden:
+                stack.enter_context(patch.object(cm.sys, "platform", "linux"))
+                stack.enter_context(patch("builtins.open", side_effect=hidden_proc))
+            st = local_cli(manager, "status", "--thread", sid, "--error-grace", "0")
+            out = local_cli(manager, "listen", *BUSY_LISTEN)
+        stop = by_thread(out).get(sid, {})
+        restored = cli(manager, "status", "--thread", sid, "--error-grace", "0")
+        check(st["exec"]["alive"] is None and st["state"]["status"] == "exec_unknown"
+              and st["codex"].get("main_stopped") and st["codex"]["stopped"] is None
+              and stop.get("reason") == "error" and not stop.get("exec_exit")
+              and by_thread(out, "watching").get(sid, {}).get("state") == "exec_unknown"
+              and restored["exec"]["alive"] is True,
+              "K6/minor1 hidden or denied process identity remains unknown and watched (%s)" % hidden)
+    finally:
+        child.communicate(timeout=5)
+    exited = by_thread(listen(manager, *BUSY_LISTEN)).get(sid, {})
+    check(exited.get("exec_exit") and exited.get("reason") == "ended",
+          "K6 confirmed death after temporary invisibility still reports exec exit (%s)" % hidden)
+
+
+def test_legacy_pid_reused_inside_window():
+    manager, sid = "mgr-legacy-identity", sid_n(93)
+    turn(sid, "setup", "old result")
+    cli(manager, "claim", "--thread", sid)
+    started = time.time()
+    cmd = [sys.executable, "-c", "import sys; sys.stdin.read()"]
+    with subprocess.Popen(cmd, stdin=subprocess.PIPE) as first:
+        first.communicate(timeout=5)
+    with subprocess.Popen(cmd, stdin=subprocess.PIPE) as second:
+        try:
+            cm.Session(BOX, sid).edit_record(lambda rec: rec.update(exec={"started": started, "pid": second.pid}))
+            st = cli(manager, "status", "--thread", sid)
+            sent = send(manager, sid, "legacy unknown", "--queue", "--via", "app")
+            check(st["exec"]["alive"] is None and not sent["ok"] and not inbox(sid) and not queued(sid),
+                  "K7 a legacy record cannot identify a PID reused within the former tolerance window")
+        finally:
+            second.communicate(timeout=5)
+
+
+def test_linux_start_token_ignores_wall_time():
+    pid = os.getpid()
+    fields = ["S"] + ["0"] * 18 + ["42"]
+
+    def proc_file(path, *args, **kwargs):
+        if path == "/proc/%d/stat" % pid:
+            return io.StringIO("%d (command with ) suffix) %s" % (pid, " ".join(fields)))
+        return io.StringIO("boot-token\n")
+
+    with patch.object(cm.sys, "platform", "linux"), patch("builtins.open", side_effect=proc_file):
+        with patch.object(cm.time, "time", side_effect=AssertionError("process identity reads wall time")):
+            known = cm.exec_alive({"pid": pid, "started": 1, "process_start": "boot-token/42"})
+            legacy = cm.exec_alive({"pid": pid, "started": 1})
+    check(known is True and legacy is None,
+          "K7 Linux start tokens match independently of wall time")
+
+
+def test_auto_queue_visibility(missing_id, number):
+    manager, sid = "mgr-auto-queue-visibility-" + str(missing_id), sid_n(number)
+    turn(sid, "setup", "old result")
+    set_mode("writer")
+    run_queue = cm.run_codex_queue
+
+    def unparseable(*args):
+        rc, _, _ = run_queue(*args)
+        return rc, "queued without a usable ID", None
+
+    fault = (patch.object(cm, "run_codex_queue", side_effect=unparseable) if missing_id else
+             patch.object(cm, "codex_queue_map", return_value=None))
+    with fault:
+        sent = local_cli(manager, "send", "--thread", sid, "--codex", FAKE, "--message", "one queue item",
+                         "--app-timeout", "0")
+        check(sent["ok"] and sent.get("transport") == "exec_busy" and sent.get("active_writer")
+              and "无法确认" in sent.get("note", "") and queued(sid) == 1 and len(exec_calls(sid)) == 1,
+              "K8 auto with zero wait attempts one resume and never assumes App (%s)" % missing_id)
+        sent = local_cli(manager, "send", "--thread", sid, "--codex", FAKE, "--message", "another queue item")
+        check(sent["ok"] and sent.get("transport") == "queued" and "无法确认" in sent.get("note", "")
+              and queued(sid) == 2 and len(exec_calls(sid)) == 1,
+              "K8 default auto reports queue uncertainty without treating the App as confirmed (%s)" % missing_id)
+    set_mode("run")
+
+
+for mode in ("new-race-empty", "new-race-started"):
+    marker = os.path.join(TMP, "finish-" + mode)
+    if os.path.exists(marker):
+        os.remove(marker)
+test_concurrent_new_turn_sends()
+test_broken_hook_output()
+test_uncertain_hook_receipt()
+test_exit_after_start_timeout()
+test_app_steer_after_exec()
+test_session_end_stays_terminal()
+test_process_visibility(True, 91)
+test_process_visibility(False, 92)
+test_legacy_pid_reused_inside_window()
+test_linux_start_token_ignores_wall_time()
+test_auto_queue_visibility(True, 94)
+test_auto_queue_visibility(False, 95)
 
 print("\n%d failure(s); tmp=%s" % (len(FAILS), TMP))
 sys.exit(1 if FAILS else 0)

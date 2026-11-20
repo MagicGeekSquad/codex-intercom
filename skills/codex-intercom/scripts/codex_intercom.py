@@ -24,6 +24,8 @@ Commands
              explicitly (--model/--effort, else saved by new/send, else the rollout's latest
              turn_context): on its own it ignores the session's settings and uses config.toml
              (openai/codex#32061).
+             A live recorded exec always gets the message through its main-thread hooks. A writer
+             conflict on resume is reported as "exec_busy", with the state of any queue item.
   listen     block until any session this manager owns needs attention; print ONE JSON line
              covering all of them (the latest stop of each, plus how many earlier stops went
              unreported), advance the report cursors, exit. A session that keeps working is
@@ -42,7 +44,7 @@ Stop reasons
   error        model request failed, none in flight, quiet for --error-grace seconds (capacity /
                rate limit / connection; Codex fires no Stop hook in that case)
   interrupted  Interrupt hook
-  ended        the `codex exec` process of an exec-transport run exited mid-turn
+  ended        the `codex exec` process exited mid-turn or after a reported main-turn error
   stalled      no events for too long (tools running: --long-stall; model request in flight:
                --model-stall; otherwise --stall); e.g. the App crashed or closed mid-turn
   not_started  a sent message did not start a turn within --start-timeout seconds, or the exec run
@@ -50,7 +52,7 @@ Stop reasons
 
 Data: --dir, else $CODEX_INTERCOM_DIR, else ~/.codex/intercom/
   <session>/events.jsonl   hook event log           <session>/state.json  working / idle (steering)
-  <session>/session.json   owner, report cursor, sends not started yet, exec run, exec settings
+  <session>/session.json   owner, report cursor, pending sends, exec run/settings
   <session>/inbox/ delivered/  steered messages      <session>/exec-*.log  exec-transport output
   <session>/rollout-*.json model, effort and token usage cached from Codex's rollout (status, listen)
   _managers/<manager>.json owned sessions, listener, last activity
@@ -256,17 +258,60 @@ def pid_alive(pid):
     return True
 
 
-def exec_alive(pid):
-    """pid_alive, but first reap our own exited child (a zombie still answers kill 0)."""
+def process_start(pid):
+    """Return the kernel start token, or None for a visible zombie."""
+    if sys.platform == "darwin":
+        import ctypes
+        # Darwin SDK sys/proc_info.h: PROC_PIDTBSDINFO returns struct proc_bsdinfo (136 bytes).
+        # pbi_status is the second uint32, and the last two uint64s are the start sec and usec.
+        info = (ctypes.c_uint64 * 17)()
+        size = ctypes.CDLL(None, use_errno=True).proc_pidinfo(
+            pid, 3, ctypes.c_uint64(0), ctypes.byref(info), ctypes.sizeof(info))
+        if size != ctypes.sizeof(info):
+            raise OSError(ctypes.get_errno(), "读取进程启动时间失败")
+        if ctypes.c_uint32.from_buffer(info, 4).value == 5:  # SZOMB
+            return None
+        sec, usec = info[-2:]
+        return "%d.%06d" % (sec, usec)
+    with open("/proc/%d/stat" % pid) as f:
+        fields = f.read().rsplit(")", 1)[1].split()
+    if fields[0] in ("Z", "X"):
+        return None
+    ticks = int(fields[19])  # field 22, relative to field 3 following the command name
+    with open("/proc/sys/kernel/random/boot_id") as f:
+        boot_id = f.read().strip()
+    return "%s/%d" % (boot_id, ticks)
+
+
+def process_start_token(pid):
     try:
-        done_pid, _ = os.waitpid(int(pid), os.WNOHANG)
-        if done_pid:
+        return process_start(pid)
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def exec_alive(ex):
+    """True only for a matching token. None means the recorded identity cannot be verified."""
+    try:
+        pid = int(ex["pid"])
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    try:
+        token = process_start(pid)
+    except (OSError, ValueError, IndexError):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
             return False
-    except ChildProcessError:
-        pass
-    except (TypeError, ValueError, OSError):
+        except OSError:
+            pass
+        return None
+    if token is None:
         return False
-    return pid_alive(pid)
+    recorded = ex.get("process_start")
+    return token == recorded if recorded else None
 
 
 def our_process_alive(rec):
@@ -767,6 +812,7 @@ class Session(object):
         self.usage_path = os.path.join(self.root, "rollout-usage.json")
         self.settings_path = os.path.join(self.root, "rollout-settings.json")
         self.lock_path = os.path.join(self.root, ".lock")
+        self.send_lock_path = os.path.join(self.root, ".send.lock")
 
     def ensure(self):
         os.makedirs(self.base, mode=0o700, exist_ok=True)
@@ -875,20 +921,22 @@ class Session(object):
             return []
         return sorted(n for n in names if n.endswith(".json"))
 
-    def inbox_messages(self, before=None):
+    def inbox_messages(self, quarantine=False):
         messages = []
         for name in self.pending_names():
             path = os.path.join(self.inbox, name)
-            # put() writes the file after send first creates the message.
-            if before is not None:
-                try:
-                    if os.path.getmtime(path) >= before:
-                        continue
-                except OSError:
-                    continue
+            if os.path.exists(os.path.join(self.delivered, name)):
+                continue  # a handoff with an unknown result must not be emitted again
             msg = read_json(path)
-            if msg:
-                messages.append(msg)
+            if not isinstance(msg, dict) or not isinstance(msg.get("text"), str):
+                if quarantine and os.path.isfile(path):
+                    os.replace(path, os.path.join(self.delivered, name + ".corrupt"))
+                continue
+            try:
+                msg["_queued_at"] = os.path.getmtime(path)
+            except OSError:
+                continue
+            messages.append(msg)
         return messages
 
     def put(self, msg):
@@ -897,20 +945,49 @@ class Session(object):
     def receipt(self, msg_id):
         return read_json(os.path.join(self.delivered, msg_id + ".json"))
 
-    def drain(self, via, turn_id):
-        """Caller holds the lock. Move every inbox message to delivered/ with a receipt."""
-        out = []
-        for name in self.pending_names():
-            src = os.path.join(self.inbox, name)
-            msg = read_json(src)
-            if msg is None or not isinstance(msg.get("text"), str):
-                os.replace(src, os.path.join(self.delivered, name + ".corrupt"))
-                continue
-            msg.update({"delivered_at": now_iso(), "delivered_via": via, "delivered_turn_id": turn_id})
-            write_json_atomic(os.path.join(self.delivered, name), msg)
-            os.remove(src)
-            out.append(msg)
-        return out
+    def recent_receipts(self):
+        try:
+            names = sorted(n for n in os.listdir(self.delivered) if n.endswith(".json"))[-5:]
+        except OSError:
+            return []
+        return [m for n in names if (m := self.receipt(n[:-5]))]
+
+    def message_snapshot(self):
+        """Sample inbox and hook receipts under the same lock as hook handoff."""
+        try:
+            with flocked(self.lock_path):
+                return self.inbox_messages(), self.recent_receipts(), self.state()
+        except FileNotFoundError:
+            return [], [], {}
+
+    def handoff(self, via, turn_id, response):
+        """Caller holds the lock. Keep inbox originals until the hook output is flushed."""
+        messages = self.inbox_messages(quarantine=True)
+        if not messages:
+            return False
+        output = response(messages)
+        prepared = []
+        try:
+            for msg in messages:
+                name = msg["id"] + ".json"
+                dest = os.path.join(self.delivered, name)
+                receipt = dict(public(msg), delivered_at=now_iso(), delivered_via=via, delivered_turn_id=turn_id,
+                               hook_output="unknown", delivery_status="unknown")
+                write_json_atomic(dest, receipt)
+                prepared.append((name, dest, receipt))
+            emit(output)
+        except (OSError, UnicodeError):
+            for _, dest, _ in prepared:
+                os.remove(dest)  # confirmed incomplete output: the originals remain eligible
+            raise
+        for name, dest, receipt in prepared:
+            try:
+                receipt["hook_output"] = "written"
+                write_json_atomic(dest, receipt)
+                os.remove(os.path.join(self.inbox, name))
+            except OSError:
+                log_error(self.base, via)  # the prepared receipt prevents a duplicate handoff
+        return True
 
 
 # ---------------------------------------------------------------------------- stop detection
@@ -967,6 +1044,9 @@ def analyze(events, now, cfg=None, after=None, exec_exited=False):
         return True, {"reason": "unknown", "t": None,
                       "summary": "没有这个 session 的 hook 事件记录（hooks 未生效，或安装后它还没运行过）"}
     seg_main = [e for e in seg if not e.get("sub")]
+    if any(turn_stop(e) for e in seg_main):
+        # A late, explicit turn result takes precedence over a legacy SessionEnd.
+        seg_main = [e for e in seg_main if e.get("ev") != "SessionEnd"]
     answered = {e.get("tool_use_id") for e in main if e.get("ev") == "PostToolUse" and e.get("tool_use_id")}
 
     prev = None
@@ -1067,32 +1147,35 @@ def terminal_hook(event):
     return turn_stop(event) or event.get("ev") == "SessionEnd"
 
 
-def exec_end(ex, recent, prompt):
-    """Summarize an exited run whose hooks have no terminal event."""
+def exec_end(ex, recent, prompt, terminal=None):
+    """Summarize an exec exit without a Stop, or one watched after an earlier error."""
     try:
         mtime = os.path.getmtime(ex.get("log") or "")
     except OSError:
         mtime = ex["started"]
-    end = {"exec_log": tilde(ex.get("log"))}
-    hint = exec_completion_hint(ex.get("log"))
-    if prompt:
+    end = {"exec_log": tilde(ex.get("log")), "exec_exit": True}
+    if terminal:
+        t = max(mtime, terminal["t"])
+        end.update(reason="ended", turn_id=terminal.get("turn"), summary="codex exec 进程已退出")
+    elif prompt:
         t = round(max(mtime, recent[-1]["t"]) + 0.001, 3)
         end.update(reason="ended", turn_id=prompt.get("turn"),
-                   summary=hint or "codex exec 进程已退出，本轮没有正常结束")
+                   summary=exec_completion_hint(ex.get("log")) or "codex exec 进程已退出，本轮没有正常结束")
     else:
         t = round(max(mtime, ex["started"]), 3)
-        end.update(reason="not_started", exec_exit=True,
-                   summary=hint or "codex exec 进程退出了，发出的消息没有开始处理")
+        end.update(reason="not_started", summary=exec_completion_hint(ex.get("log"))
+                   or "codex exec 进程退出了，发出的消息没有开始处理")
     return dict(end, t=t, at=ts_iso(t))
 
 
-def current(rec, read_events, now, cfg):
-    """Analyze the latest turn from a snapshot taken after any observed exec exit."""
+def current(rec, read_events, now, cfg, pending_exec=False):
+    """Read main-turn facts and exec liveness independently of notification history."""
     events = read_events()
     ex = rec.get("exec") or {}
     reported_end = ex.get("reported_end")
-    exited = bool(reported_end) or ex.get("returncode") is not None
-    if not exited and ex and ex.get("pid") and not exec_alive(ex["pid"]):
+    exited = ex.get("returncode") is not None
+    running = exec_alive(ex) if not exited and ex.get("pid") else False
+    if not exited and ex.get("pid") and running is False:
         # Stop and UserPromptSubmit are synchronous: an exiting process may have just written them.
         events = read_events()
         exited = True
@@ -1106,26 +1189,83 @@ def current(rec, read_events, now, cfg):
     superseded = bool(latest_prompt and (not prompt or latest_prompt.get("turn") != prompt.get("turn")))
     if reported_end and latest_prompt:
         superseded = reported_end["reason"] == "not_started" or latest_prompt.get("turn") != reported_end.get("turn_id")
-    # Older installs can log SessionEnd. The notified exec exit already covers it, but a final
-    # Stop must still be visible even when that SessionEnd is first in the snapshot.
-    covered_ends = []
-    if reported_end and reported_end["reason"] == "ended" and not superseded:
-        covered_ends = [e for e in recent if e.get("ev") == "SessionEnd"
-                        and e.get("turn") in (None, reported_end.get("turn_id"))]
-    terminal = next((e for e in recent if terminal_hook(e) and e not in covered_ends and (
-        not prompt or (e["t"] >= prompt["t"] and e.get("turn") in (None, prompt.get("turn"))))), None)
+    terminals = [e for e in recent if terminal_hook(e) and (
+        not prompt or (e["t"] >= prompt["t"] and e.get("turn") in (None, prompt.get("turn"))))]
+    terminal = next((e for e in terminals if turn_stop(e)), terminals[0] if terminals else None)
+    follow_exit = ex.get("watch_exit") or pending_exec
     end = None
-    if exited and launch is not None and not terminal and not superseded and not ex.get("terminal_reported"):
-        end = reported_end or exec_end(ex, recent, prompt)
-    analyzed = [e for e in events if e not in covered_ends] if covered_ends else events
-    stopped, info = analyze(analyzed, now, cfg, after=launch if terminal and not latest_prompt else None,
-                            exec_exited=bool(end and prompt))
-    if end and end["reason"] == "ended" and (not prompt or info["reason"] not in ("error", "asking")):
+    if exited and launch is not None:
+        if not superseded and not terminal:
+            end = exec_end(ex, recent, prompt)
+        elif first and follow_exit:
+            end = exec_end(ex, recent, prompt, terminal or first)
+    if running is not False and launch is not None and not recent:
+        stopped, info = False, {"reason": "starting", "summary": "已登记 codex exec，正在等本轮的 hook 事件"}
+    else:
+        scope = launch if not latest_prompt and (running is not False or terminal) else None
+        stopped, info = analyze(events, now, cfg, after=scope, exec_exited=bool(exited and not superseded and prompt))
+    if end and not terminal and not superseded and end["reason"] == "ended" and (
+            not prompt or info["reason"] not in ("error", "asking")):
         stopped, info = True, end
     if reported_end and reported_end["reason"] == "not_started" and superseded:
         prompt = terminal = None
+    exec_watch = None
+    if follow_exit or (not terminal and not superseded):
+        if running is None:
+            exec_watch = "exec_unknown"
+        elif running and stopped:
+            exec_watch = "exec_busy"
+    if exec_watch and stopped:
+        info = dict(info, main_stopped=True, exec_alive=running, exec_log=tilde(ex.get("log")))
+        info["summary"] += "。codex exec 进程尚未退出" if running else "。暂时无法核对 codex exec 进程身份"
+    last = recent[-1] if recent else {}
+    failed = last.get("ev") == "PostModelRequest" and last.get("status") == "failed"
+    if running is not False and (exec_watch or failed):
+        after = max(launch or 0, main[-1]["t"] if main else 0)
+        worker = next((e for e in reversed(events) if e.get("sub") and e["t"] >= after), None)
+        if (worker and now - worker["t"] < cfg["model_stall"]
+                and worker["ev"] in ("PreModelRequest", "PostModelRequest", "PostToolUse")
+                and worker.get("status") != "failed"):
+            info["subagent_activity"] = {"agent": worker["sub"], "event": worker["ev"], "at": ts_iso(worker["t"])}
+            if info.get("main_stopped"):
+                info["summary"] += "，子代理最近仍有活动"
     return {"stopped": stopped, "info": info, "exec_end": end, "exec_exited": exited,
+            "exec_running": running, "exec_watch": exec_watch, "exec_superseded": superseded,
             "exec_start": prompt or terminal, "exec_terminal": terminal, "main": main, "events": events}
+
+
+def pending_send(x, queue):
+    transport = x.get("transport")
+    item = {"id": x.get("id"), "preview": x.get("preview"), "transport": transport}
+    if transport in ("queued", "exec_busy"):
+        qid = x.get("qid")
+        item.update(queue_id=qid, in_codex_queue=qid in queue if queue is not None and qid else None)
+    return item
+
+
+QUEUE_REMAINING = ("消息仍在 Codex 队列，支持取队列的客户端可以接收。"
+                   "请先用 status 核对，确认写入者退出且原条目仍在时，用 --via exec 发一条续跑提示读取原消息。")
+QUEUE_UNKNOWN = "暂时无法确认原条目是否仍在 Codex 队列，请用 status 和 listen 核对队列与开工事件后再处理。"
+
+
+def queue_note(queue, qid):
+    if queue is None or not qid:
+        return QUEUE_UNKNOWN
+    if qid in queue:
+        return QUEUE_REMAINING
+    return "原条目已离开 Codex 队列，请用 status 和 listen 核对是否开工，再决定是否需要重发。"
+
+
+def add_undelivered(report, messages):
+    if messages:
+        report["undelivered"] = [{"id": m["id"], "preview": clip(m.get("text", ""), 80)} for m in messages]
+        if report.get("exec_exit"):
+            report["undelivered_note"] = "未送达的插话仍在 inbox，下一条 send 的主线 hook 会带上这些消息。"
+
+
+def for_exec(messages, ex):
+    log = ex.get("log")
+    return [m for m in messages if log and m.get("target_exec") == log]
 
 
 def assess(box, rec, read_events, now, cfg, queue):
@@ -1136,24 +1276,42 @@ def assess(box, rec, read_events, now, cfg, queue):
       waiting         sends that still need a start notification; started: those that have started
       attention       what listen reports to the owner right now, or None
       exec_end        the synthetic end of a finished exec run, if any"""
-    state = current(rec, read_events, now, cfg)
+    ex = rec.get("exec") or {}
+    inbox, receipts, hook_state = box.message_snapshot()
+    exec_inbox = for_exec(inbox, ex)
+    state = current(rec, read_events, now, cfg, pending_exec=bool(exec_inbox))
+    if state["exec_exited"] and exec_inbox:
+        # The process may have handed off a steer while the exit snapshot was being taken.
+        inbox, receipts, hook_state = box.message_snapshot()
+        exec_inbox = for_exec(inbox, ex)
     main, end = state["main"], state["exec_end"]
     stopped, info = state["stopped"], state["info"]
-    ex = rec.get("exec") or {}
     expects = rec.get("expect") or []
     exec_id = ex.get("send_id")
     if ex.get("started") is not None and not exec_id:  # older exec records lack the send id
         exec_id = next((x["id"] for x in reversed(expects)
                         if x.get("transport") == "exec" and x["t"] <= ex["started"]), None)
-    exec_send = next((x for x in expects if x.get("id") == exec_id), None)
+    exec_send = next((x for x in expects if x["id"] == exec_id), None)
     if (exec_send and queue is not None and exec_send.get("qid") in queue
             and (state["exec_start"] or state["exec_exited"])):
         queue = codex_queue_map()  # an auto fallback may have drained it since the first read
+    count = queued_count(queue, box.sid)
+    queue_unverified = queue is None and any(x.get("qid") and x.get("transport") != "exec" for x in expects)
+    terminal = state["exec_terminal"]
+    if (not end and terminal and state["exec_exited"] and not state["exec_superseded"]
+            and (count or queue_unverified)):
+        # A legacy record can still have queued work even if the exec wrote a real Stop.
+        state["exec_end"] = end = exec_end(ex, main, state["exec_start"], terminal)
     prompts = [e for e in main if e.get("ev") == "UserPromptSubmit"]
     waiting, started = [], []
     for x in expects:
         start = None
-        if not x.get("queuing") and (queue is None or x.get("qid") not in queue):
+        qid = x.get("qid")
+        if x.get("transport") in ("queued", "exec_busy"):
+            queue_taken = bool(qid) and queue is not None and qid not in queue
+        else:
+            queue_taken = queue is None or qid not in queue
+        if not x.get("queuing") and queue_taken:
             start = (state["exec_start"] if x is exec_send else
                      next((p for p in prompts if p["t"] > x["t"]), None))
         if start:
@@ -1169,57 +1327,90 @@ def assess(box, rec, read_events, now, cfg, queue):
         last_stop = next((e for e in reversed(main) if e["t"] > reported and turn_stop(e)), None)
         if last_stop is not None:
             candidate = turn_stop_info(last_stop, main)
+    if (candidate is info and info["reason"] == "ended" and terminal and terminal["ev"] == "SessionEnd"
+            and info.get("t") == terminal["t"] and state["exec_exited"] and not state["exec_superseded"]
+            and ex.get("reported_end")):
+        # SessionEnd still supplies the terminal state. The exit was already notified.
+        candidate = None
     att = None
+    expired = []
     # A later queued send cannot be answered by an old stop. A stop tied to an earlier send
     # of ours can still be reported in its own right while the later send waits.
     if candidate is not None and candidate is not end and (t := candidate.get("t")) is not None and t > reported:
         covered = [(x, start) for x, start in started if start["t"] <= t]
-        if not waiting or any(start.get("turn") == candidate.get("turn_id") for _, start in covered):
+        launch = ex.get("started")
+        live_exec_stop = state["exec_watch"] and candidate is info and launch is not None and t > launch
+        if live_exec_stop or not waiting or any(start.get("turn") == candidate.get("turn_id") for _, start in covered):
             att = dict(candidate, _cursor=t)
             # A stop without a terminal hook can still resume and write its final result.
             if any(e["t"] == t and e.get("turn") == candidate.get("turn_id") and terminal_hook(e) for e in main):
                 att["_drop"] = [x["id"] for x, _ in covered]
-            if state["exec_terminal"] and state["exec_terminal"]["t"] == t:
-                att["_exec_update"] = (ex, {"terminal_reported": True})
+            if live_exec_stop and info["reason"] == "error":
+                att["_exec_update"] = (ex, {"watch_exit": True})
             n = stops_between(main, reported, t)
             if n:
                 att["earlier_stops"] = n
-    if att is None and info is end and end and end["reason"] == "ended" and not ex.get("reported_end"):
-        att = dict(end, _exec_update=(ex, {"reported_end": end}))
-        start_t = state["exec_start"]["t"]
-        earlier = [e for e in main if reported < e["t"] < start_t and turn_stop(e)]
-        if earlier:
-            # Acknowledge the older stops while leaving this exec's late Stop reportable.
-            cursor = earlier[-1]["t"]
-            turns = {e["turn"] for e in earlier if e.get("turn")}
-            att.update(earlier_stops=len(earlier), _cursor=cursor,
-                       _drop=[x["id"] for x, start in started if start["t"] <= cursor and start.get("turn") in turns])
+    if att is None and end and not ex.get("reported_end"):
+        att = dict(end)
+        if end["reason"] == "not_started":
+            # The exit notification is distinct from any earlier start-timeout notification.
+            expired = [exec_send] if exec_send in waiting else []
+        else:
+            start_t = state["exec_start"]["t"]
+            earlier = [e for e in main if reported < e["t"] < start_t and turn_stop(e)]
+            if earlier:
+                # Acknowledge the older stops while leaving this exec's late Stop reportable.
+                cursor = earlier[-1]["t"]
+                turns = {e["turn"] for e in earlier if e.get("turn")}
+                att.update(earlier_stops=len(earlier), _cursor=cursor,
+                           _drop=[x["id"] for x, start in started if start["t"] <= cursor and start.get("turn") in turns])
     if att is None and waiting:
         expired = [x for x in waiting if now - x["t"] >= cfg["start_timeout"]]
-        if end and end["reason"] == "not_started" and exec_send in waiting and not ex.get("reported_end"):
-            expired = [exec_send]
-            att = dict(end, _exec_update=(ex, {"reported_end": end}))
-        elif expired:
+        if expired:
             first = min(x["t"] for x in expired)
             t = round(first + cfg["start_timeout"], 3)
             att = {"reason": "not_started", "t": t, "at": ts_iso(t),
                    "summary": "%d 秒内 Codex 没有开始处理发出的消息" % (now - first)}
-        if att:
-            att["_not_started"] = [x["id"] for x in expired]
-            att["queued"] = [{"id": x.get("id"), "preview": x.get("preview"), "transport": x.get("transport")}
-                             for x in expired]
-            att["codex_queue"] = queued_count(queue, box.sid)
-            if stopped and info.get("reason") != "unknown":  # what holds it up, e.g. approval / asking
-                att["session_state"] = {"reason": info["reason"], "summary": info.get("summary")}
-            blocked = blocking_popups(main)
-            if blocked:
-                att["blocked_by_question"] = flat_questions(blocked)
+    if expired:
+        att["_not_started"] = [x["id"] for x in expired]
+        att["queued"] = [pending_send(x, queue) for x in expired]
+        att["codex_queue"] = count
+        unverified = [x.get("qid") for x in expired if x.get("transport") in ("queued", "exec_busy")]
+        if unverified:
+            qid = next((qid for qid in unverified if queue is not None and qid in queue), unverified[0])
+            att["queue_note"] = queue_note(queue, qid)
+        if stopped and info.get("reason") != "unknown":
+            att["session_state"] = {"reason": info["reason"], "summary": info.get("summary")}
+        blocked = blocking_popups(main)
+        if blocked:
+            att["blocked_by_question"] = flat_questions(blocked)
     if att is not None:
-        before = last_stop["t"] if last_stop and att.get("_cursor") == last_stop["t"] else None
-        undelivered = box.inbox_messages(before=before)
-        if undelivered:
-            att["undelivered"] = [{"id": m["id"], "preview": clip(m.get("text", ""), 80)} for m in undelivered]
-    return dict(state, waiting=waiting, started=[x for x, _ in started], attention=att, queue=queue)
+        if end and not ex.get("reported_end") and (att.get("exec_exit") or (
+                att.get("turn_id") is not None and att["turn_id"] == end.get("turn_id"))):
+            ack = att.get("_exec_update", (ex, {}))[1]
+            if not att.get("exec_exit"):
+                att["summary"] += "。codex exec 进程已退出"
+            att.update(exec_exit=True, exec_alive=False, exec_log=end["exec_log"],
+                       _exec_update=(ex, dict(ack, reported_end=end)))
+            if count:
+                att["codex_queue"] = count
+                if att["reason"] != "not_started":
+                    att["queued"] = [pending_send(x, queue) for x in expects if queue.get(x.get("qid")) == box.sid]
+                att["queue_note"] = QUEUE_REMAINING
+            elif queue_unverified:
+                att.update(codex_queue=None, queue_note=QUEUE_UNKNOWN)
+        turn = att.get("turn_id")
+        before = last_stop["t"] if last_stop and att.get("_cursor") == last_stop["t"] else now
+        owned = exec_inbox if att.get("exec_exit") else [
+            m for m in inbox if turn and m.get("target_turn") == turn and m["_queued_at"] < before]
+        add_undelivered(att, owned)
+        if turn:
+            offered = [m for m in receipts if m.get("delivered_turn_id") == turn]
+            if offered:
+                att["delivery_unknown"] = [{"id": m["id"], "hook_output": m.get("hook_output", "unknown")}
+                                           for m in offered]
+    return dict(state, waiting=waiting, started=[x for x, _ in started], attention=att, queue=queue,
+                inbox=inbox, receipts=receipts, hook_state=hook_state)
 
 
 # ---------------------------------------------------------------------------- hook side
@@ -1378,23 +1569,24 @@ def handle_hook(base, data):
             if event == "UserPromptSubmit":
                 box.rotate_events()
             box.set_state("working", turn, event)
-            msgs = box.drain(event, turn)
-        if msgs:
-            return {
+            box.handoff(event, turn, lambda msgs: {
                 "systemMessage": ui_text(msgs),
                 "hookSpecificOutput": {"hookEventName": event, "additionalContext": context_text(msgs)},
-            }
+            })
         return None
 
     if event == "Stop":
         with box.locked():
-            msgs = box.drain(event, turn)
-            box.set_state("working" if msgs else "idle", turn, event)
-            rec["continued"] = bool(msgs)
-            box.log_event(rec)
-        if msgs:
-            return {"decision": "block", "reason": continuation_text(msgs), "systemMessage": ui_text(msgs)}
-        return {}
+            continued = False
+            try:
+                continued = box.handoff(event, turn, lambda msgs: {
+                    "decision": "block", "reason": continuation_text(msgs), "systemMessage": ui_text(msgs),
+                })
+            finally:
+                box.set_state("working" if continued else "idle", turn, event)
+                rec["continued"] = continued
+                box.log_event(rec)
+        return None if continued else {}
 
     # Interrupt / SessionEnd. Undelivered messages stay in the inbox and ride along with the next
     # user prompt (UserPromptSubmit); listen reports them as `undelivered`.
@@ -1456,11 +1648,10 @@ def cmd_hook(args):
         event = data.get("hook_event_name")
         debug_log(base, data)
         out = handle_hook(base, data)
+        if out is not None:
+            emit(out)
     except Exception:
         log_error(base, event)
-        out = {} if event == "Stop" else None
-    if out is not None:
-        emit(out)
     return 0
 
 
@@ -1612,7 +1803,7 @@ def exec_turn_started(output, exited):
 
 def start_exec(box, codex, prompt, settings, watch_s=15.0):
     """Run `codex exec resume <sid> <prompt>` detached, in the session's working directory. Returns
-    once it is clearly running (or failed). The App holding the session shows up as active_writer."""
+    once it is clearly running (or failed). A writer conflict does not identify the writer."""
     cwd = box.last_cwd()
     if not cwd or not os.path.isdir(cwd):
         return {"ok": False, "error": "不知道这个 session 的工作目录（%s），无法用 exec 运行" % cwd}
@@ -1633,7 +1824,7 @@ def start_exec(box, codex, prompt, settings, watch_s=15.0):
         p = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=lf, stderr=subprocess.STDOUT,
                              start_new_session=True, env=dict(os.environ, CODEX_INTERCOM_DIR=box.base))
     running = {"ok": True, "exec_pid": p.pid, "exec_log": tilde(log), "cwd": cwd, "exec_settings": resolved,
-               "_log": log, "_started": t_spawn}
+               "_log": log, "_started": t_spawn, "_process_start": process_start_token(p.pid)}
     with open(log, "rb") as output:
         while True:
             rc = p.poll()
@@ -1643,7 +1834,7 @@ def start_exec(box, codex, prompt, settings, watch_s=15.0):
             if rc is not None:
                 output.seek(0)
                 tail = output.read().decode("utf-8", errors="replace")[-4000:]
-                if "active writer" in tail:
+                if rc and re.search(r"(?mi)^Error: thread/resume\b.*\balready has an active writer\b", tail):
                     return {"ok": False, "active_writer": True, "exec_log": tilde(log)}
                 if rc == 0:
                     return dict(running, _returncode=rc)
@@ -1675,6 +1866,7 @@ def record_exec(box, r, send_id=None):
     """Publish the exec run and its send together, so listen can attribute its hooks."""
     def fn(rec):
         run = {"pid": r["exec_pid"], "started": r["_started"], "log": r["_log"], "send_id": send_id}
+        run["process_start"] = r.get("_process_start")
         if "_returncode" in r:
             run["returncode"] = r["_returncode"]
         rec["exec"] = run
@@ -1754,11 +1946,12 @@ def cmd_new(args):
             started = round(time.time(), 3) - 0.001
             proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=lf, stderr=subprocess.STDOUT,
                                     start_new_session=True, env=dict(os.environ, CODEX_INTERCOM_DIR=base))
+        process_token = process_start_token(proc.pid)
         sid, error = wait_for_thread(proc, log, NEW_START_TIMEOUT)
         result.update(thread=sid, exec_pid=proc.pid, exec_log=tilde(log))
         if sid:
             xid = "%d-%s" % (time.time_ns(), uuid.uuid4().hex[:6])
-            run = {"pid": proc.pid, "started": started, "log": log, "send_id": xid}
+            run = {"pid": proc.pid, "started": started, "log": log, "send_id": xid, "process_start": process_token}
             first_exec = {"run": run,
                           "expect": {"id": xid, "t": started, "preview": clip(text, 80), "transport": "exec"}}
             ok, own = claim(Session(base, sid), mgr, label=args.label, checkin=args.checkin,
@@ -1800,14 +1993,15 @@ def deliver_stopped(box, args, msg, result, settings):
         else:
             expect_drop(box, xid)
             if r.get("active_writer"):
-                result["error"] = "Codex App 正打开着这个 session（active writer），请不用 --via exec"
+                result.update(transport="exec_busy",
+                              error="session 已有写入者，无法启动新的 exec。消息未排队，可以在写入者退出后重发。")
         return r.get("ok", False)
     rc, out, qid = run_codex_queue(args.codex, sid, text)
     result.update({"mode": "queue", "ok": rc == 0, "codex_queue": out})
     if rc != 0:
         expect_drop(box, xid)
         return False
-    expect_set(box, xid, queuing=None, qid=qid, transport="app")
+    expect_set(box, xid, queuing=None, qid=qid, transport="app" if args.via == "app" else "queued")
     blocked = blocking_popups([e for e in box.events() if not e.get("sub")])
     if blocked:
         result.update(transport="blocked", blocked_by_question=flat_questions(blocked),
@@ -1816,26 +2010,36 @@ def deliver_stopped(box, args, msg, result, settings):
     if args.via == "app":
         result["transport"] = "app"
         return True
-    deadline = time.time() + args.app_timeout  # auto: does the App take it?
-    while time.time() < deadline:
+    deadline = time.monotonic() + args.app_timeout  # auto: does the App take it?
+    while True:
         queue = codex_queue_map()
-        if queue is None:
-            result.update(transport="app", note="读不到 Codex 队列，假定 App 会处理")
+        if queue is None or not qid:
+            if args.app_timeout <= 0:
+                break  # explicit zero wait still attempts the usual single exec fallback
+            result.update(transport="queued", queue_id=qid, note=QUEUE_UNKNOWN)
             return True
         if qid not in queue:
+            expect_set(box, xid, transport="app")
             result["transport"] = "app"
             return True
-        time.sleep(0.5)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.5, remaining))
     r = start_exec(box, args.codex, EXEC_NUDGE, settings)
     if r.get("active_writer"):
-        result.update(transport="app", note="App 打开着这个 session 但还没取走消息，它空下来就会处理")
+        expect_set(box, xid, transport="exec_busy")
+        result.update(transport="exec_busy", active_writer=True, exec_log=r["exec_log"], queue_id=qid,
+                      note="session 已有写入者，当前无法确认处理方。" + queue_note(codex_queue_map(), qid))
     elif r.get("ok"):
         record_exec(box, r, xid)
         result.update(transport="exec", exec_pid=r["exec_pid"], exec_log=r["exec_log"], cwd=r["cwd"],
                       exec_settings=r["exec_settings"])
+        if queue is None or not qid:
+            result.update(queue_id=qid, note="已启动 exec 续跑，原队列项是否开工仍需用 listen 或 status 核对。")
     else:
-        result.update(transport="queued", exec_error=r.get("error"),
-                      note="App 没有处理，exec 也没能启动；消息留在 Codex 队列里，App 打开这个 session 时会处理")
+        result.update(transport="queued", exec_error=r.get("error"), queue_id=qid,
+                      note="codex exec 未能启动。" + queue_note(codex_queue_map(), qid))
     return True
 
 
@@ -1848,25 +2052,53 @@ def cmd_send(args):
     base = base_dir(args.dir)
     box, mgr = Session(base, sid), Manager(base, manager_id(args.manager))
     settings = requested_exec_settings(args)
-    ok, own = claim(box, mgr, args.take_over, args.label, args.checkin, settings=settings)
-    if not ok:
-        print(json.dumps(own, ensure_ascii=False))
-        return 2
-    msg = {"id": "%d-%s" % (time.time_ns(), uuid.uuid4().hex[:6]), "text": text,
-           "from": args.sender, "created_at": now_iso()}
-    result = {"thread": sid, "id": msg["id"], "manager": mgr.id}
-    result.update(own)
+    box.ensure()
+    # Serialize transport selection through launch and registration, without holding the hook lock.
+    with flocked(box.send_lock_path):
+        ok, own = claim(box, mgr, args.take_over, args.label, args.checkin, settings=settings)
+        if not ok:
+            print(json.dumps(own, ensure_ascii=False))
+            return 2
+        msg = {"id": "%d-%s" % (time.time_ns(), uuid.uuid4().hex[:6]), "text": text,
+               "from": args.sender, "created_at": now_iso()}
+        result = dict(own, thread=sid, id=msg["id"], manager=mgr.id)
 
-    steered = False
-    if not args.queue:
+        previous_exit = None
         with box.locked():
-            if (box.state().get("status") == "working"
-                    and not current(box.record(), box.events, time.time(), cfg)["stopped"]):
+            rec = box.record()
+            ex = rec.get("exec") or {}
+            exec_inbox = for_exec(box.inbox_messages(), ex)
+            state = current(rec, box.events, time.time(), cfg, pending_exec=bool(exec_inbox))
+            live = state["exec_running"]
+            hook_state = box.state()
+            if live is None:
+                result.update(ok=False, exec_alive=None,
+                              error="暂时无法核对已登记 exec 的进程身份。消息未入队，请用 status 确认后再发。")
+            elif live or (not args.queue and hook_state.get("status") == "working" and not state["stopped"]):
+                info = state["info"]
+                turn = info.get("turn_id") if live else hook_state.get("turn_id")
+                msg["target_turn"] = turn
+                if live:
+                    msg["target_exec"] = ex.get("log")
                 box.put(msg)
-                steered = True
-                result.update({"mode": "steer", "ok": True, "turn_id": box.state().get("turn_id")})
-    if not steered:
-        deliver_stopped(box, args, msg, result, settings)
+                result.update(mode="steer", ok=True, turn_id=turn)
+                if live:
+                    latest = state["main"][-1] if state["main"] else {}
+                    failed = latest.get("ev") == "PostModelRequest" and latest.get("status") == "failed"
+                    note = "主线最近一次模型请求失败，codex exec 仍在运行。" if failed else "codex exec 仍在运行。"
+                    if info.get("subagent_activity"):
+                        note += "子代理最近仍有活动。"
+                    note += "消息等主线的开工、工具返回或 Stop hook 注入。若进程先退出，未送达插话会随下一条 send 带上。"
+                    result.update(transport="exec_busy", exec_alive=True, note=note)
+            elif state["exec_end"] and not ex.get("reported_end"):
+                previous_exit = public(state["exec_end"])
+                add_undelivered(previous_exit, exec_inbox)
+                if "undelivered" in previous_exit:
+                    previous_exit["undelivered_note"] = "这些插话在旧 exec 退出前未送达，会由后续主线 hook 带上。"
+        if "ok" not in result:
+            deliver_stopped(box, args, msg, result, settings)
+            if result.get("transport") == "exec" and previous_exit:
+                result["previous_exec_exit"] = previous_exit
     if settings and result.get("transport") != "exec":
         result["ignored_exec_options"] = ["--" + key for key in settings]
     return send_result(result, mgr)
@@ -1905,7 +2137,7 @@ def scan(base, mgr, cfg, logs, now, default_checkin=DEFAULT_CHECKIN):
         log = logs.get(sid)
         if log is None:
             log = logs[sid] = EventLog(box.events_path)
-        a = assess(box, rec, log.read, now, cfg, queue() if rec["expect"] else None)
+        a = assess(box, rec, log.read, now, cfg, queue() if rec["expect"] or rec.get("exec") else None)
         events = a["events"]
         att = a["attention"]
         waiting = a["waiting"]
@@ -1913,8 +2145,17 @@ def scan(base, mgr, cfg, logs, now, default_checkin=DEFAULT_CHECKIN):
             reports.append(dict(head, **att))
             notified = set(att.get("_not_started", ()))
             waiting = [x for x in waiting if x["id"] not in notified]
-        if waiting:
-            watching.append(dict(head, state="waiting_start", since=ts_iso(min(x["t"] for x in waiting)),
+        if a["exec_watch"]:
+            info = a["info"]
+            watch = dict(head, state=a["exec_watch"], reason=info["reason"], exec_alive=a["exec_running"],
+                         summary=info.get("summary") or "暂时无法核对 codex exec 进程身份",
+                         _interval=0, _elapsed=0)
+            if info.get("subagent_activity"):
+                watch["subagent_activity"] = info["subagent_activity"]
+            watching.append(watch)
+        elif waiting or a["info"]["reason"] == "starting":
+            since = min(x["t"] for x in waiting) if waiting else rec["exec"]["started"]
+            watching.append(dict(head, state="waiting_start", since=ts_iso(since),
                                  _interval=0, _elapsed=0))
         elif not a["stopped"]:
             starts = [e["t"] for e in events if not e.get("sub") and e.get("ev") == "UserPromptSubmit"]
@@ -1995,7 +2236,8 @@ def listen_loop(base, mgr, cfg, timeout=0, settle=2.0, poll=1.0, checkin=DEFAULT
                         item.update(progress_snapshot(box, w["_events"], w["_info"], now))
                         progress.append(item)
                 rest = [w for w in working if w["thread"] not in ids]
-                parts = ["%s：%s" % (r.get("label") or r["thread"][:8], r["reason"]) for r in reports + lost]
+                parts = ["%s：%s" % (r.get("label") or r["thread"][:8],
+                                    r["summary"] if r.get("main_stopped") else r["reason"]) for r in reports + lost]
                 parts += ["%s：仍在工作（本轮 %s）" % (p.get("label") or p["thread"][:8], span(p.get("running_s") or 0))
                           for p in progress]
                 reason = "attention" if reports or lost else "checkin"
@@ -2071,7 +2313,9 @@ def cmd_list(args):
             row["label"] = rec["label"]
         if rec.get("manager") != mgr.id:
             row["owner"] = rec.get("manager")
-        if a["waiting"]:
+        if a["exec_watch"]:
+            row.update(state=a["exec_watch"], reason=info["reason"], at=info.get("at"))
+        elif a["waiting"] or info["reason"] == "starting":
             row["state"] = "waiting_start"
         elif not a["stopped"]:
             row.update(state="working", in_flight=info.get("in_flight"), silence_s=info.get("silence_s"))
@@ -2100,20 +2344,27 @@ def cmd_status(args):
     queue = codex_queue_map()
     a = assess(box, rec, box.events, now, cfg_from(args), queue)
     evs = a["events"]
-    info = dict(a["info"], stopped=a["stopped"])
+    stopped = a["stopped"] and not a["exec_watch"]
+    if a["stopped"] and a["exec_watch"] == "exec_unknown":
+        stopped = None
+    info = dict(a["info"], stopped=stopped)
     info.pop("t", None)
     if info.get("last_message"):
         info["last_message"] = clip_tail(info["last_message"], 300)
     owner = rec.get("manager")
     om = Manager(base, owner) if owner else None
     od = om.data() if om else {}
-    try:
-        done = sorted(n for n in os.listdir(box.delivered) if n.endswith(".json"))[-5:]
-    except OSError:
-        done = []
     main = [e for e in evs if not e.get("sub")]
     ex = rec.get("exec")
-    progress = None if a["stopped"] or a["waiting"] else progress_snapshot(box, evs, a["info"], now)
+    hook_state = a["hook_state"]
+    if a["exec_watch"]:
+        hook_state["status"] = a["exec_watch"]
+    elif info["reason"] == "starting":
+        hook_state = {"status": "starting"}
+    elif a["exec_end"] and a["stopped"] and hook_state.get("status") == "working":
+        hook_state["status"] = "idle"
+    progress = (None if a["stopped"] or a["waiting"] or info["reason"] == "starting"
+                else progress_snapshot(box, evs, a["info"], now))
     if progress and progress["turn_id"]:
         usage = progress.pop("usage", None)
     else:
@@ -2130,18 +2381,27 @@ def cmd_status(args):
         "reported_upto": ts_iso(rec.get("reported")),
         "checkin_s": rec.get("checkin"),
         "last_checkin": ts_iso(rec.get("checked")),
-        "pending_sends": [{"id": x.get("id"), "preview": x.get("preview"), "transport": x.get("transport"),
-                           "sent_at": ts_iso(x.get("t"))} for x in a["waiting"]],
+        "pending_sends": [dict(pending_send(x, a["queue"]), sent_at=ts_iso(x["t"])) for x in a["waiting"]],
         "open_questions": flat_questions(open_questions(main)),
         "blocked_by_question": bool(blocking_popups(main)),
         "exec": {"pid": ex.get("pid"), "started": ex.get("started"), "log": tilde(ex.get("log")),
-                 "alive": not a["exec_exited"] and bool(ex.get("pid"))} if ex else None,
+                 "alive": a["exec_running"]} if ex else None,
         "codex_queue": queued_count(a["queue"], sid),
-        "inbox": [{"id": m["id"], "preview": clip(m.get("text", ""), 80)} for m in box.inbox_messages()],
-        "recent_delivered": [{k: (box.receipt(n[:-5]) or {}).get(k) for k in ("id", "delivered_via", "delivered_at")}
-                             for n in done],
-        "state": box.state() or None,
+        "inbox": [{"id": m["id"], "preview": clip(m.get("text", ""), 80)} for m in a["inbox"]],
+        "recent_delivered": [
+            {k: m.get(k) for k in ("id", "delivered_via", "delivered_at")}
+            | {"hook_output": m.get("hook_output", "unknown"), "delivery_status": "unknown"}
+            for m in a["receipts"]
+        ],
+        "state": hook_state or None,
     }
+    conflicts = [x for x in rec["expect"] if x.get("transport") == "exec_busy"]
+    if conflicts:
+        out["queue_conflicts"] = [
+            {"id": x["id"], "queue_id": x.get("qid"),
+             "in_codex_queue": a["queue"].get(x["qid"]) == sid if a["queue"] is not None and x.get("qid") else None}
+            for x in conflicts
+        ]
     if usage:
         out["usage"] = usage
     print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -2490,7 +2750,7 @@ def main(argv=None):
     s.add_argument("--checkin", type=parse_duration, default=None,
                    help="progress check-in interval for this session while it works (10m, 1h, off); "
                         "default: listen's --checkin")
-    s.add_argument("--queue", action="store_true", help="never steer; always start a new turn")
+    s.add_argument("--queue", action="store_true", help="prefer a new turn unless a recorded exec is still running")
     s.add_argument("--via", choices=("auto", "app", "exec"), default="auto",
                    help="new-turn transport: auto = codex queue, then exec if the App doesn't take it; "
                         "app = codex queue only; exec = codex exec resume only")

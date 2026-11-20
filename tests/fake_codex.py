@@ -5,7 +5,8 @@
                       run: drain the queue, fire UserPromptSubmit + Stop hooks, exit 0;
                       crash: drain, fire UserPromptSubmit, exit without a Stop;
                       resume-fast-exit[-with-stop|-writer-text]: fire hooks, then exit on SIGTERM
-  exec ...         -> new-* modes: emit startup JSONL and optionally run the first turn
+  exec ...         -> new-* modes: emit startup JSONL and optionally run the first turn;
+                      new-busy: keep the writer after a main model error and run a worker hook
 """
 import json
 import os
@@ -38,8 +39,9 @@ def hook(tid, ev, turn="exec-turn", **kw):
     data = dict(session_id=tid, hook_event_name=ev, turn_id=turn, cwd=os.getcwd(),
                 transcript_path="/x/rollout-%s.jsonl" % tid, **kw)
     hook_dir = os.environ.get("CODEX_INTERCOM_DIR") or os.environ["FAKE_BOX"]
-    subprocess.run([sys.executable, os.environ["FAKE_MB"], "--dir", hook_dir, "hook"],
-                   input=json.dumps(data), capture_output=True, text=True, check=True)
+    proc = subprocess.run([sys.executable, os.environ["FAKE_MB"], "--dir", hook_dir, "hook"],
+                          input=json.dumps(data), capture_output=True, text=True, check=True)
+    return json.loads(proc.stdout) if proc.stdout else None
 
 
 def wait_for_finish(name):
@@ -52,6 +54,9 @@ def wait_for_finish(name):
 
 if args[:1] == ["queue"]:
     tid, msg = args[args.index("--thread") + 1], args[args.index("--message") + 1]
+    if os.path.exists(os.path.join(D, "pause-queue-" + tid)):
+        open(os.path.join(D, "in-queue-" + tid), "w").close()
+        wait_for_finish("finish-queue-" + tid)
     qid = str(uuid.uuid4())
     con = db()
     con.execute("insert into queued_items values (?,?,?,?,?,?)",
@@ -68,7 +73,7 @@ if args[:2] == ["exec", "resume"]:
     fast_exit = mode in ("resume-fast-exit", "resume-fast-exit-with-stop", "resume-fast-exit-writer-text")
     if not fast_exit and mode not in ("resume-race", "resume-stop-only"):
         time.sleep(1)
-    if mode == "writer":
+    if mode == "writer" or os.path.exists(os.path.join(D, "writer-" + tid)):
         print("Error: thread/resume: thread/resume failed: thread %s already has an active writer (code -32600)" % tid)
         sys.exit(1)
     if mode == "fail":
@@ -84,7 +89,10 @@ if args[:2] == ["exec", "resume"]:
         hook(tid, "Stop", turn="resume-turn", last_assistant_message="resume without prompt hook")
         print(json.dumps({"type": "turn.started"}), flush=True)
         sys.exit(0)
-    hook(tid, "UserPromptSubmit", prompt=prompt)
+    injected = hook(tid, "UserPromptSubmit", prompt=prompt)
+    if injected:
+        with open(os.path.join(D, "resume-injected-" + tid), "w") as f:
+            json.dump(injected, f)
     print(json.dumps({"type": "turn.started"}), flush=True)
     if fast_exit:
         if mode == "resume-fast-exit-with-stop":
@@ -125,6 +133,9 @@ if args[:2] == ["exec", "--json"]:
         hook(tid, "UserPromptSubmit", prompt=args[-1])
     if mode in ("new-finished", "new-stop-only", "new-stop-only-wait"):
         hook(tid, "Stop", last_assistant_message="第一轮已完成")
+    if mode == "new-busy":
+        writer = os.path.join(D, "writer-" + tid)
+        open(writer, "w").close()
     # Emit the id after the relevant hooks, so claim always sees the intended ordering.
     started_line = json.dumps({"type": "thread.started", "thread_id": tid.upper()})
     if mode == "new-started":
@@ -135,6 +146,23 @@ if args[:2] == ["exec", "--json"]:
         hook(tid, "Stop", last_assistant_message="第一轮已完成")
     else:
         print(started_line, flush=True)
+    if mode == "new-busy":
+        hook(tid, "PreModelRequest")
+        hook(tid, "PostModelRequest", status="failed", error="Selected model is at capacity")
+        hook(tid, "PreModelRequest", turn="worker-turn", agent_id="worker-1", agent_type="worker")
+        hook(tid, "PostToolUse", turn="worker-turn", tool_name="Bash", agent_id="worker-1", agent_type="worker")
+        open(os.path.join(D, "failed-" + tid), "w").close()
+        wait_for_finish("finish-" + tid)
+        if os.path.exists(os.path.join(D, "recover-" + tid)):
+            hook(tid, "PreModelRequest")
+            hook(tid, "PostModelRequest", status="completed")
+            first = hook(tid, "PostToolUse", tool_name="Bash")
+            second = hook(tid, "PostToolUse", tool_name="Bash")
+            with open(os.path.join(D, "recovered-" + tid), "w") as f:
+                json.dump([first, second], f)
+            hook(tid, "Stop", last_assistant_message="main recovered")
+            print(json.dumps({"type": "turn.completed"}), flush=True)
+        os.remove(writer)
     if mode == "new-stop-only-wait":
         wait_for_finish("finish-new-stop-only-wait")
     if mode in ("new-race-empty", "new-race-started"):

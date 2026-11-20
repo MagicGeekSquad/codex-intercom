@@ -179,14 +179,24 @@ script lives under `~/.claude/plugins/`).
 | Command | What it does |
 |---|---|
 | `CI new --label NAME --message "…"` | Start a Codex session with its first task in a detached exec and claim the returned thread ID. Options: `--cwd DIR`, `--model M`, `--effort E`, `--search`, `--checkin`. Reads stdin when `--message` is omitted. Exec-started sessions don't show up in the Codex App. |
-| `CI send --thread <id> --message "…"` | Deliver a message and take ownership of the session. Options: `--label NAME`, `--checkin 10m\|1h\|off`, `--queue` (never steer), `--via auto\|app\|exec`, `--take-over`, `--model M` / `--effort E` (for exec resume). Reads stdin when `--message` is omitted. |
+| `CI send --thread <id> --message "…"` | Deliver a message and take ownership of the session. Options: `--label NAME`, `--checkin 10m\|1h\|off`, `--queue` (request a new turn), `--via auto\|app\|exec`, `--take-over`, `--model M` / `--effort E` (for exec resume). Reads stdin when `--message` is omitted. |
 | `CI listen` | Block until any owned session needs attention, print one JSON line, exit. Run in the background; one per manager. Options: `--checkin 30m`, `--timeout N`. |
-| `CI list` | Your sessions and their state (`working`, `waiting_start`, `stopped` + reason). `--all` shows every managed session and its manager. |
+| `CI list` | Your sessions and their state (`working`, `exec_busy`, `exec_unknown`, `waiting_start`, `stopped` + reason). `--all` shows every managed session and its manager. |
 | `CI status --thread <id>` | Inspect the owner, current state, progress, recorded model and token usage, unreported stops, pending sends, popups, exec run and queue. |
 | `CI claim --thread <id>` / `CI release --thread <id>` | Start managing a session without sending / hand it back (popups allowed again). |
 | `CI doctor [--thread <id>]` | Check the installation and recent hook activity. |
 | `CI install` / `CI uninstall [--remove-script]` | Register / remove the Codex hooks (`hooks.json` is backed up first). |
 | `CI gc` | Delete data of old, unmanaged sessions. |
+
+While a recorded exec is alive, `send` returns `mode: steer` and `transport: exec_busy` and
+puts the message in the inbox. The main thread can take it at `UserPromptSubmit`, `PostToolUse`,
+or `Stop`. This also applies to `--queue` and explicit routes. If the process exits first, the next
+send carries the message still in the inbox.
+A writer conflict from exec resume returns `active_writer: true`. For an original Codex queue
+item, consult `queue_id` and `note` before attempting delivery yourself. Direct exec resume can
+reject a message before it is queued.
+If auto cannot verify the queue, the response reports its uncertainty. With `--app-timeout 0` it
+still attempts one exec resume.
 
 ### What `listen` reports
 
@@ -207,14 +217,21 @@ script lives under `~/.claude/plugins/`).
 | `done` | The turn finished; `last_message` is Codex's final reply (a question, if it needs input). |
 | `asking` | A Codex App question popup is still open (only answerable in the App). |
 | `approval` | Codex has been waiting for an approval for 30 s+ (only answerable in Codex). |
-| `error` | A model request failed and Codex stopped (capacity, rate limit, network). Reported once per failure streak. |
+| `error` | The main turn stopped after a model request failed. The exec and any recent subagent activity can continue. Reported once per failure streak. |
 | `interrupted` | Someone pressed stop. |
-| `ended` | The headless `codex exec` run exited mid-turn. |
+| `ended` | The headless `codex exec` run exited mid-turn or after its exit was being watched. |
 | `stalled` | No events for too long (5 min idle, 15 min in a model request, 30 min in a tool) — e.g. the App closed mid-turn. |
 | `not_started` | A sent message didn't start a turn within 5 min (with what's blocking it). |
 
 Each stop may also carry `earlier_stops` (stops nobody heard; only the latest is reported) and
 `undelivered` (steered messages that missed the turn — they ride along with the next message).
+After a main-turn error, `exec_alive: true` and any `subagent_activity` give the state of the
+still-running process. A normal `Stop` is enough when no previous error or undelivered steer
+requires watching the exit. An exit report can carry `undelivered_note` for inbox messages and
+`queue_note` for an existing Codex queue item.
+An unverified process remains in `watching` as `exec_unknown` while its exit needs observation.
+A timed-out start can be followed by a separate process-exit notice. In `delivery_unknown`,
+`hook_output: written` confirms output to the hook pipe. Whether Codex consumed it is unknown.
 
 ### Progress check-ins
 

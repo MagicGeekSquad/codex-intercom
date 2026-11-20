@@ -40,7 +40,7 @@ codex-intercom 就是这条通道。它是一个 Claude Code skill 加一组 Cod
 
 ## 功能特性
 
-- **插话或开新一轮**：Codex 工作时，消息在它下一次工具调用后注入；停着时通过 `codex queue` 开新一轮，
+- **插话或开新一轮**：插话由主线的 `UserPromptSubmit`、`PostToolUse` 或 `Stop` 注入。开新一轮时通过 `codex queue`，
   App 没接手就自动改用 `codex exec resume`，在 session 原来的工作目录里运行。
 - **准确的停止原因**：`done`、`asking`、`approval`、`error`（容量不足、限流、网络）、`interrupted`、`ended`、
   `stalled`、`not_started`，每种都附带下一步需要的信息。
@@ -164,14 +164,21 @@ Codex session 可以用链接（`codex://threads/<uuid>`，可从 Codex App 复�
 | 命令 | 作用 |
 |---|---|
 | `CI new --label 短名 --message "…"` | 新建 Codex session，在后台 exec 运行第一轮并开始管理。选项：`--cwd 目录`、`--model 模型`、`--effort 强度`、`--search`、`--checkin`。省略 `--message` 时从 stdin 读取。用 exec 新建的 session 在 Codex App 里看不到。 |
-| `CI send --thread <id> --message "…"` | 发消息，并开始管理这个 session。选项：`--label 短名`、`--checkin 10m\|1h\|off`、`--queue`（不插话）、`--via auto\|app\|exec`、`--take-over`、`--model 模型` / `--effort 强度`（用于 exec 续跑）。省略 `--message` 时从 stdin 读取。 |
+| `CI send --thread <id> --message "…"` | 发消息，并开始管理这个 session。选项：`--label 短名`、`--checkin 10m\|1h\|off`、`--queue`（请求开新一轮）、`--via auto\|app\|exec`、`--take-over`、`--model 模型` / `--effort 强度`（用于 exec 续跑）。省略 `--message` 时从 stdin 读取。 |
 | `CI listen` | 阻塞到任何一个被管理的 session 需要处理，输出一行 JSON 后退出。后台运行，每个管理者一个。选项：`--checkin 30m`、`--timeout N`。 |
-| `CI list` | 你管理的 session 及其状态（`working`、`waiting_start`、`stopped` + 原因）。`--all` 列出所有被管理的 session 和各自的管理者。 |
+| `CI list` | 你管理的 session 及其状态（`working`、`exec_busy`、`exec_unknown`、`waiting_start`、`stopped` + 原因）。`--all` 列出所有被管理的 session 和各自的管理者。 |
 | `CI status --thread <id>` | 查看管理者、当前状态、进展快照、实际模型和用量，以及未报告的停下、未开始的消息、弹窗、exec 进程和队列。 |
 | `CI claim --thread <id>` / `CI release --thread <id>` | 不发消息也开始管理 / 交还（恢复 App 弹窗提问）。 |
 | `CI doctor [--thread <id>]` | 检查安装情况和最近的 hook 活动。 |
 | `CI install` / `CI uninstall [--remove-script]` | 注册 / 移除 Codex hooks（先备份 `hooks.json`）。 |
 | `CI gc` | 删除很久没动、无人管理的 session 数据。 |
+
+已登记的 exec 存活时，`send` 返回 `mode: steer` 和 `transport: exec_busy`，插话经 inbox 等主线
+`UserPromptSubmit`、`PostToolUse` 或 `Stop` 注入。加 `--queue` 或指定新回合通道时也走这条路径。
+进程先退出时，仍在 inbox 的插话随下一条消息带上。
+若尝试续跑才遇到写入冲突，`active_writer: true` 表示写入者身份未知，可根据 `queue_id` 和 `note`
+核对原 Codex 队列项并决定下一步。直接用 exec 遇到冲突时，消息在入队前就被拒绝。
+自动通道无法核对原队列项时会说明位置未知。`--app-timeout 0` 仍会尝试一次 exec 续跑。
 
 ### `listen` 的输出
 
@@ -191,14 +198,18 @@ Codex session 可以用链接（`codex://threads/<uuid>`，可从 Codex App 复�
 | `done` | 本轮结束，`last_message` 是 Codex 的最后回复（需要你决定时，问题就在这里）。 |
 | `asking` | Codex App 里还开着提问弹窗（只能在 App 里回答）。 |
 | `approval` | Codex 等批准已超过 30 秒（只能在 Codex 里处理）。 |
-| `error` | 模型请求失败后停下（容量不足、限流、网络）。同一段连续失败只报一次。 |
+| `error` | 主线因模型请求失败停下。exec 仍存活时，会附上进程状态和最近看到的子代理活动。同一段连续失败只报一次。 |
 | `interrupted` | 有人点了停止。 |
-| `ended` | 后台的 `codex exec` 进程在回合中途退出。 |
+| `ended` | 后台的 `codex exec` 进程退出。正常 `Stop` 已给出本轮结果，先报过错误或还有未送达插话时才继续观察进程。 |
 | `stalled` | 太久没有任何事件（空闲 5 分钟、模型请求中 15 分钟、工具运行中 30 分钟），比如 App 在回合中途被关掉。 |
 | `not_started` | 发出的消息 5 分钟内没有开始处理（附带卡在哪里）。 |
 
 每项还可能带 `earlier_stops`（没人听到的停下次数，只报最近一次）和 `undelivered`（没赶上那一轮的插话，
 会随下一条消息一起发给 Codex）。
+收到 `exec_exit: true` 时，`undelivered_note` 说明 inbox 里未送达的插话如何带到后续回合，`queue_note`
+说明如何核对 Codex 队列中的旧消息。
+进程身份暂时无法确认时，`watching` 会用 `exec_unknown` 提示继续观察。开工超时和实际退出分别报告。
+`delivery_unknown` 中的 `hook_output: written` 表示 hook 已成功写出，Codex 是否消费仍需核对。
 
 ### 定期查看进展
 

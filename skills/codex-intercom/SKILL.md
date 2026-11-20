@@ -29,19 +29,23 @@ CI send --thread <uuid 或 codex://threads/uuid> --message "消息内容" [--lab
 - 请 Codex 把详情写进交付文件，最后回复用两三句概括。`last_message` 会进入管理者的上下文，短回复可以节省 token。
 - `--label`：给这个 session 起个短名（如 `auth-refactor`），之后 `listen` 和 `list` 的输出里都会带上。同时管理多个 session 时建议加。
 - `--checkin 10m`：这个 session 一直在工作时，每隔多久唤醒你看一次进展（`90s`、`10m`、`1h`；`off` 关闭）。不加就用 `listen` 的默认值（30 分钟）。按任务的预计时长和需要盯得多紧来定。
-- `--queue`：不插话，总是开新一轮。`--via app|exec`：指定开新一轮的通道，默认 `auto`。
+- `--queue` 请求开新一轮，`--via app|exec` 指定新一轮的通道，默认 `auto`。已登记的 exec 存活时，一律通过主线 hook 插话。
 - `--model` 和 `--effort` 只在走 exec 时生效，显式指定的值会保存为该 session 以后走 exec 的默认值。省略时，脚本会逐项沿用已保存的值或 rollout 中最近的非空值并显式传给 `codex exec resume`，因为该命令自行续跑时会改用 Codex 配置。
 
 输出是一行 JSON：
 
 | 字段 | 含义 |
 |---|---|
-| `mode: steer` | Codex 正在工作，消息会在它下一次工具调用后注入；如果回合正要结束，就作为续写提示 |
+| `mode: steer` | 消息已进入 inbox，等主线 `UserPromptSubmit`、`PostToolUse` 或 `Stop` 注入。 |
 | `mode: queue`，`transport: app` | 消息已交给 App 通道，可能还在排队；用 `listen` 或 `status` 看这一轮的状态 |
-| `transport: exec` | App 没打开这个 session，已用 `codex exec resume` 在 session 原目录后台运行（输出在 `exec_log`） |
-| `transport: queued` | 没有人在处理，消息留在 Codex 队列里，App 打开这个 session 时才会处理 |
+| `transport: exec` | 已用 `codex exec resume` 在 session 原目录后台运行（输出在 `exec_log`） |
+| `mode: steer`，`transport: exec_busy`，`exec_alive: true` | 已登记的 exec 仍活着，正文走同一条 inbox 路径。进程先退出时，`undelivered` 中的插话会随下一条消息带上。 |
+| `mode: queue`，`transport: exec_busy`，`active_writer: true` | 正文已提交到 Codex 队列，启动续跑时遇到身份未知的写入者。`queue_id` 是原条目，`note` 会说明在哪里核对，以及确认写入者退出后如何让 exec 读取仍在队列里的原正文。 |
+| `transport: exec_busy`，`ok: false`，`active_writer: true` | 直接用 exec 启动时遇到写入冲突。消息未排队，写入者退出后可以重发。 |
+| `previous_exec_exit` | 本次发送启动了新的 exec，附上发送时观察到的旧 exec 退出和当时未送达的插话。 |
+| `transport: queued` | Codex 已接受入队请求，交付还需确认。用 `queue_id` 和 `note` 核对原条目和下一步。 |
 | `transport: blocked` | App 里有接管之前就弹出的提问弹窗还没处理（`blocked_by_question`）。消息已经排队，要等用户在 App 里回答、跳过或取消弹窗后才会开始 |
-| `exec_settings` / `ignored_exec_options` | exec 续跑时，`exec_settings` 逐项记录 `model` 和 `effort` 的传参值 `value` 和来源 `source`，来源为 `explicit`（本次参数）、`session`（保存值）、`rollout`（历史记录）或 `config`（沿用 Codex 配置，`value` 为 `null`）。本轮没有走 exec 时，`ignored_exec_options` 列出本次传了但未生效的选项 |
+| `exec_settings` / `ignored_exec_options` | exec 续跑时，`exec_settings` 逐项记录 `model` 和 `effort` 的传参值 `value` 和来源 `source`，来源为 `explicit`（本次参数）、`session`（保存值）、`rollout`（历史记录）或 `config`（沿用 Codex 配置，`value` 为 `null`）。`ignored_exec_options` 列出这次没有用到的选项。 |
 | `claimed` / `taken_over_from` / `previous_owner` | 这次发送让你开始管理它 / 从谁手里接管 / 接手了谁已失效的管理 |
 | `listening` | 你是否已有 `listen` 在后台运行。为 `false` 时启动一个（见下节）；为 `true` 时什么都不用做，新 session 会自动被它盯上 |
 | `ok: false` | 发送失败，原因见 `codex_queue` 或 `error` |
@@ -79,7 +83,7 @@ CI listen
 | `stops` | 需要处理的 session 列表，每项含 `thread`、`label`、`reason`、`summary`、`at`，以及下表的附加字段 |
 | `progress` | 仍在工作、到了查看时间的 session 的进展快照（见下文） |
 | `lost` | 被别的管理者接管（`taken_over`，`by` 是谁）或被强制交还（`released`）的 session，你不再管理它们 |
-| `watching` | 还在跑的 session（`state: working`，或 `waiting_start`：发出的消息还没开始） |
+| `watching` | 仍需观察的 session。`working` 表示主线正在运行，`exec_busy` 表示主线停下后仍需等 exec 退出，`exec_unknown` 表示仍需核对进程身份，`waiting_start` 表示在等新一轮的 hook。 |
 
 `stops` 里每项的 `reason`：
 
@@ -88,16 +92,19 @@ CI listen
 | `done` | 本轮结束，`last_message` 是 Codex 的最后回复 |
 | `asking` | 本轮结束时 App 里还开着提问弹窗（`questions`），只能由用户在 App 里回答、跳过或取消，弹窗开着时新消息会一直排队。被管理的 session 不会再弹出新的弹窗，只会出现在开始管理之前就已弹出、或 hook 失效的情况 |
 | `approval` | Codex 在等批准（`tool`、`detail`），已经等了 30 秒以上，只能在 App 里处理 |
-| `error` | 模型请求失败后停下（`error`：容量不足、限流、网络等；`failures` 是连续失败次数）。网络错误时 Codex 还会自己重连；同一段连续失败只报一次 |
+| `error` | 主线模型请求失败后停下。`error` 是容量不足、限流或网络错误等，`failures` 是连续失败次数。同一段连续失败只报一次。 |
 | `interrupted` | 本轮被中断（用户在 App 里点了停止） |
-| `ended` | `codex exec` 进程退出时，hooks 还没有记录到本轮结束（`exec_log`）。稍后收到真实 `Stop` 时，还会报告它的 `last_message` |
+| `ended` | `codex exec` 进程退出（`exec_log`）。正常 `Stop` 已经给出本轮结果，先报过错误或还有未送达插话时才继续观察进程。若 `Stop` 晚到，还会报告它的 `last_message`。 |
 | `stalled` | 太久没有任何事件（工具运行中 30 分钟、模型请求中 15 分钟、其他情况 5 分钟），可能是 App 崩溃、卡住，或者关掉了这个 session |
-| `not_started` | 发出的消息 5 分钟内没有开始处理（`queued` 是这些消息，`codex_queue` 是 Codex 队列里的条数，`session_state` 是 session 卡在哪，`blocked_by_question` 是挡路的弹窗），或者 exec 进程没开始就退出了（`exec_exit`） |
+| `not_started` | 消息 5 分钟内没有确认开工（`queued` 是这些消息，`codex_queue` 是 Codex 队列里的条数，`session_state` 是 session 卡在哪，`blocked_by_question` 是挡路的弹窗），或者 exec 在开工前退出了（`exec_exit`）。已经报过开工超时后，实际退出仍会另报。 |
 
 附加字段：
 
 - `earlier_stops`：这次报告之前还停过几次、都没报告过（只报最近一次）。
-- `undelivered`：插话还没送达就停了。这些消息会随下一条发给 Codex 的消息自动带上，不要重发，否则 Codex 会收到两遍。
+- `undelivered` 列出尚在 inbox、仍可由 hook 交付的插话，包括确认写出失败后保留的正文。下一条发给 Codex 的消息会带上这些插话。
+- `delivery_unknown` 列出同回合的 hook 交付记录。`hook_output: written` 表示 JSON 已成功写出，Codex 是否消费仍需核对。写出结果本身无法确认时，`hook_output` 为 `unknown`。
+- `exec_alive: true` 和 `main_stopped: true` 表示主线已经停下，进程仍活着。`subagent_activity` 有值时，`agent`、`event` 和 `at` 是主线停下后最近看到的子代理活动。
+- `exec_exit: true` 表示进程已经退出。`undelivered_note` 说明未送达的插话会由下一条 `send` 的主线 hook 带上。`queue_note` 说明如何核对 Codex 队列中的旧消息。
 - 后续消息还在排队时，`listen` 可以先报告已确认开工的上一条消息的结果，后续消息继续出现在 `watching` 里。其他回合的停下会暂缓，等到已发消息自己的结果可以一起报告，或在开工超时之后的下一次 `listen` 报告。
 
 `progress` 里每项（进展快照）：
@@ -110,7 +117,7 @@ CI listen
 | `activity` | 从 Codex 自己的会话记录读出的本轮动态：`messages` 是 Codex 最近几条进度说明，`recent_commands` / `commands_run` 是最近执行的命令和总数，`files_changed` 是改过的文件，`compactions` 是上下文压缩次数，`partial: true` 表示本轮太长只读了后半段。会话记录格式不归本 skill 控制，读不到时没有这一项 |
 | `usage` | `stops` 的各项和 `status` 顶层也会包含此字段。它从 Codex 的会话记录读取 `model`、`effort`、本轮用量 `turn` 和会话累计用量 `session`。用量字段为 `input`、`cached_input`、`output`、`reasoning` 和 `total`。缺失的部分省略，全部缺失时省略 `usage` |
 
-看完进展，方向对就直接再启动 `listen`，不必向用户汇报“无变化”。跑偏了就用 `send` 插话纠正，消息会在 Codex 下一次工具调用后注入。需要细节时用 `status`。
+看完进展，方向对就直接再启动 `listen`，不必向用户汇报“无变化”。跑偏了就用 `send` 插话纠正，正文会等下一个可消费的主线 hook。需要细节时用 `status`。
 
 ## 管理与交还
 
@@ -120,8 +127,11 @@ CI listen
 
 ## 查状态
 
-- `CI list`：你管理的所有 session，每项有 `state`（`working` / `waiting_start` / `stopped` + `reason` / `unknown`）、`unreported`（下次 `listen` 会不会报它）、`last_message`。`--all` 列出所有被管理的 session 和各自的管理者。
-- `CI status --thread <id>`：单个 session 的细节：管理者（`owner`）、当前判断（`codex`）、工作中时的进展快照（`progress`）、实际模型和用量（`usage`）、待报告的停下（`unreported`）、还在等开工通知的消息（`pending_sends`）、查看间隔（`checkin_s`、`last_checkin`）、未处理的提问弹窗、最近一次 exec 及其存活状态、Codex 队列条数、未送达和最近送达的插话。
+- `CI list`：你管理的所有 session，每项有 `state`（`working` / `exec_busy` / `exec_unknown` / `waiting_start` / `stopped` + `reason` / `unknown`）、`unreported`（下次 `listen` 会不会报它）、`last_message`。`--all` 列出所有被管理的 session 和各自的管理者。
+- `CI status --thread <id>`：单个 session 的细节：管理者（`owner`）、当前判断（`codex`）、工作中时的进展快照（`progress`）、实际模型和用量（`usage`）、待报告的停下（`unreported`）、还在等开工通知的消息（`pending_sends`）、查看间隔（`checkin_s`、`last_checkin`）、未处理的提问弹窗、最近一次 exec 及其存活状态、Codex 队列条数、`inbox` 和最近一次 hook 交付记录。
+- `recent_delivered` 保留原字段名，记录最近的 hook 交付尝试。其中 `delivery_status: unknown` 表示没有 Codex 消费回执。已写出或写出结果不明的正文留有记录，需要核对接收情况后再决定是否重发。
+- `queue_conflicts` 列出已知写入冲突对应的 `queue_id`。以 `in_codex_queue` 核对原条目，即使这条消息已经报过 `not_started`。为 `null` 时，队列位置尚未确认。
+- 等新 exec 的首个 hook 时，`status` 显示 `starting`。主线已停下但还在等 exec 退出时，`state.status` 为 `exec_busy`，`exec.alive` 和 `codex.main_stopped` 为 `true`，整个 session 的 `codex.stopped` 为 `false`。还需观察的 exec 若无法核对身份，`state.status` 为 `exec_unknown`，`exec.alive` 为 `null`。缺少启动标识的旧记录也按这条规则观察。若主线已经停下，此时 `codex.stopped` 为 `null`，表示整个 session 是否停下仍未知。
 
 ## 安装与排障
 
